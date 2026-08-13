@@ -1,0 +1,381 @@
+"""Main window for the Raw Image Viewer."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+from PySide6.QtCore import Qt, QSettings, QTimer
+from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .raw_loader import (
+    BAYER_PATTERNS,
+    NORMALIZATION_MODES,
+    RawFormatError,
+    load_sidecar_metadata,
+    process_raw_file,
+)
+
+ORG_NAME = "RawImageOpener"
+APP_NAME = "RawImageViewer"
+RAW_EXTENSIONS = {".raw"}
+
+
+class ImageLabel(QLabel):
+    """A QLabel that keeps its pixmap scaled to fit while preserving aspect ratio."""
+
+    def __init__(self):
+        super().__init__()
+        self._original_pixmap: QPixmap | None = None
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(200, 200)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet("background-color: #202020; color: #aaaaaa;")
+
+    def set_image(self, pixmap: QPixmap) -> None:
+        self._original_pixmap = pixmap
+        self._rescale()
+
+    def clear_image(self, text: str = "") -> None:
+        self._original_pixmap = None
+        self.setText(text)
+
+    def _rescale(self) -> None:
+        if self._original_pixmap is None:
+            return
+        scaled = self._original_pixmap.scaled(
+            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.setPixmap(scaled)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._rescale()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Raw Image Viewer")
+        self.resize(1100, 750)
+
+        self.settings = QSettings(ORG_NAME, APP_NAME)
+
+        self.folder: Path | None = None
+        self.files: list[Path] = []
+        self.index: int = -1
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(150)
+        self._refresh_timer.timeout.connect(self._render_current)
+
+        self._build_ui()
+        self._load_settings()
+        self._connect_shortcuts()
+        self._update_nav_state()
+
+    # ---------- UI construction ----------
+    def _build_ui(self) -> None:
+        central = QWidget()
+        root = QHBoxLayout(central)
+
+        left = QVBoxLayout()
+        self.image_label = ImageLabel()
+        self.image_label.setText("Open a folder to begin")
+        left.addWidget(self.image_label, stretch=1)
+
+        nav_bar = QHBoxLayout()
+        self.prev_button = QPushButton("◀ Previous")
+        self.next_button = QPushButton("Next ▶")
+        self.status_label = QLabel("No folder selected")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.prev_button.clicked.connect(self.show_previous)
+        self.next_button.clicked.connect(self.show_next)
+        nav_bar.addWidget(self.prev_button)
+        nav_bar.addWidget(self.status_label, stretch=1)
+        nav_bar.addWidget(self.next_button)
+        left.addLayout(nav_bar)
+
+        root.addLayout(left, stretch=3)
+
+        panel = QVBoxLayout()
+
+        open_button = QPushButton("Open Folder…")
+        open_button.clicked.connect(self.open_folder)
+        panel.addWidget(open_button)
+
+        format_box = QGroupBox("Raw format")
+        form = QFormLayout(format_box)
+
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(1, 20000)
+        self.width_spin.setValue(5328)
+        form.addRow("Width", self.width_spin)
+
+        self.auto_height_check = QCheckBox("Auto (from file size)")
+        self.auto_height_check.setChecked(True)
+        form.addRow("", self.auto_height_check)
+
+        self.height_spin = QSpinBox()
+        self.height_spin.setRange(1, 20000)
+        self.height_spin.setValue(4608)
+        self.height_spin.setEnabled(False)
+        form.addRow("Height", self.height_spin)
+
+        self.bpp_combo = QComboBox()
+        self.bpp_combo.addItems(["1 byte (8-bit)", "2 bytes (16-bit)"])
+        form.addRow("Bytes / pixel", self.bpp_combo)
+
+        self.endian_combo = QComboBox()
+        self.endian_combo.addItems(["Little-endian", "Big-endian"])
+        form.addRow("Byte order", self.endian_combo)
+
+        self.pattern_combo = QComboBox()
+        self.pattern_combo.addItems(BAYER_PATTERNS)
+        self.pattern_combo.setCurrentIndex(BAYER_PATTERNS.index("RGGB"))
+        form.addRow("Bayer pattern", self.pattern_combo)
+
+        self.norm_combo = QComboBox()
+        self.norm_combo.addItems(NORMALIZATION_MODES)
+        form.addRow("Display levels", self.norm_combo)
+
+        self._format_controls = [
+            self.width_spin,
+            self.auto_height_check,
+            self.height_spin,
+            self.bpp_combo,
+            self.endian_combo,
+            self.pattern_combo,
+        ]
+
+        panel.addWidget(format_box)
+
+        self.sidecar_label = QLabel("")
+        self.sidecar_label.setWordWrap(True)
+        self.sidecar_label.setStyleSheet("color: #2e7d32;")
+        panel.addWidget(self.sidecar_label)
+
+        hint = QLabel(
+            "These .raw files have no header, so width/height/bit depth "
+            "can't be detected automatically. Adjust the fields above until "
+            "the preview looks correct - a wrong width shows up as diagonal "
+            "tearing. If a matching <name>.json sidecar sits next to a .raw "
+            "file, its format is used automatically instead."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666666;")
+        panel.addWidget(hint)
+
+        panel.addStretch(1)
+
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet("color: #c0392b;")
+        panel.addWidget(self.error_label)
+
+        root.addLayout(panel, stretch=1)
+
+        self.setCentralWidget(central)
+
+        for signal in (
+            self.width_spin.valueChanged,
+            self.height_spin.valueChanged,
+            self.bpp_combo.currentIndexChanged,
+            self.endian_combo.currentIndexChanged,
+            self.pattern_combo.currentIndexChanged,
+            self.norm_combo.currentIndexChanged,
+        ):
+            signal.connect(self._on_format_changed)
+
+        self.auto_height_check.toggled.connect(self._on_auto_height_toggled)
+
+    def _connect_shortcuts(self) -> None:
+        QShortcut(QKeySequence(Qt.Key_Right), self, activated=self.show_next)
+        QShortcut(QKeySequence(Qt.Key_Left), self, activated=self.show_previous)
+
+    # ---------- settings persistence ----------
+    def _load_settings(self) -> None:
+        s = self.settings
+        self.width_spin.setValue(int(s.value("width", 5328)))
+        self.height_spin.setValue(int(s.value("height", 4608)))
+        self.auto_height_check.setChecked(str(s.value("auto_height", "true")) == "true")
+        self.bpp_combo.setCurrentIndex(int(s.value("bpp_index", 0)))
+        self.endian_combo.setCurrentIndex(int(s.value("endian_index", 0)))
+        self.pattern_combo.setCurrentIndex(
+            int(s.value("pattern_index", BAYER_PATTERNS.index("RGGB")))
+        )
+        self.norm_combo.setCurrentIndex(int(s.value("norm_index", 0)))
+        last_folder = s.value("last_folder", "")
+        if last_folder and Path(last_folder).is_dir():
+            self._set_folder(Path(last_folder))
+
+    def _save_settings(self) -> None:
+        s = self.settings
+        s.setValue("width", self.width_spin.value())
+        s.setValue("height", self.height_spin.value())
+        s.setValue("auto_height", "true" if self.auto_height_check.isChecked() else "false")
+        s.setValue("bpp_index", self.bpp_combo.currentIndex())
+        s.setValue("endian_index", self.endian_combo.currentIndex())
+        s.setValue("pattern_index", self.pattern_combo.currentIndex())
+        s.setValue("norm_index", self.norm_combo.currentIndex())
+        if self.folder:
+            s.setValue("last_folder", str(self.folder))
+
+    def closeEvent(self, event) -> None:
+        self._save_settings()
+        super().closeEvent(event)
+
+    # ---------- folder / navigation ----------
+    def open_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select folder containing .raw images")
+        if folder:
+            self._set_folder(Path(folder))
+
+    def _set_folder(self, folder: Path) -> None:
+        files = sorted(
+            p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in RAW_EXTENSIONS
+        )
+        self.folder = folder
+        self.files = files
+        self.index = 0 if files else -1
+        self._save_settings()
+        if not files:
+            self.image_label.clear_image(f"No .raw files found in:\n{folder}")
+            self.status_label.setText("No .raw files found")
+            self._update_nav_state()
+            return
+        self._render_current()
+
+    def show_next(self) -> None:
+        if self.index + 1 < len(self.files):
+            self.index += 1
+            self._render_current()
+
+    def show_previous(self) -> None:
+        if self.index > 0:
+            self.index -= 1
+            self._render_current()
+
+    def _update_nav_state(self) -> None:
+        has_files = bool(self.files)
+        self.prev_button.setEnabled(has_files and self.index > 0)
+        self.next_button.setEnabled(has_files and self.index + 1 < len(self.files))
+
+    # ---------- format controls ----------
+    def _on_auto_height_toggled(self, checked: bool) -> None:
+        self.height_spin.setEnabled(not checked)
+        self._on_format_changed()
+
+    def _on_format_changed(self) -> None:
+        self._refresh_timer.start()
+
+    def _current_format(self):
+        bytes_per_pixel = 1 if self.bpp_combo.currentIndex() == 0 else 2
+        big_endian = self.endian_combo.currentIndex() == 1
+        pattern = self.pattern_combo.currentText()
+        norm_mode = self.norm_combo.currentText()
+        width = self.width_spin.value()
+        height = None if self.auto_height_check.isChecked() else self.height_spin.value()
+        return width, height, bytes_per_pixel, big_endian, pattern, norm_mode
+
+    # ---------- rendering ----------
+    def _render_current(self) -> None:
+        if self.index < 0 or self.index >= len(self.files):
+            return
+        path = self.files[self.index]
+        norm_mode = self.norm_combo.currentText()
+
+        sidecar = load_sidecar_metadata(path)
+        self._apply_sidecar_to_controls(sidecar)
+        if sidecar is not None:
+            width, height = sidecar["width"], sidecar["height"]
+            bytes_per_pixel = sidecar["bytes_per_pixel"]
+            big_endian = sidecar["big_endian"]
+            pattern = sidecar["pattern"]
+        else:
+            width, height, bytes_per_pixel, big_endian, pattern, _ = self._current_format()
+
+        try:
+            image8, resolved_height = process_raw_file(
+                path, width, height, bytes_per_pixel, big_endian, pattern, norm_mode
+            )
+        except RawFormatError as exc:
+            self.image_label.clear_image(str(exc))
+            self.error_label.setText(str(exc))
+            self.status_label.setText(f"{self.index + 1} / {len(self.files)} — {path.name}")
+            self._update_nav_state()
+            return
+
+        self.error_label.setText("")
+        if sidecar is None and self.auto_height_check.isChecked():
+            self.height_spin.blockSignals(True)
+            self.height_spin.setValue(resolved_height)
+            self.height_spin.blockSignals(False)
+
+        qimage = _numpy_to_qimage(image8)
+        self.image_label.set_image(QPixmap.fromImage(qimage))
+        self.status_label.setText(f"{self.index + 1} / {len(self.files)} — {path.name}")
+        self._update_nav_state()
+
+    def _apply_sidecar_to_controls(self, sidecar: dict | None) -> None:
+        for widget in self._format_controls:
+            widget.setEnabled(sidecar is None)
+        if sidecar is None:
+            self.sidecar_label.setText("")
+            self.auto_height_check.setEnabled(True)
+            self.height_spin.setEnabled(not self.auto_height_check.isChecked())
+            return
+
+        self.sidecar_label.setText(
+            f"Using detected format from {sidecar['source']}: "
+            f"{sidecar['width']}x{sidecar['height']}, {sidecar['pattern']}, "
+            f"{sidecar['bytes_per_pixel'] * 8}-bit"
+        )
+        for widget, value in (
+            (self.width_spin, sidecar["width"]),
+            (self.height_spin, sidecar["height"]),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+
+        self.bpp_combo.blockSignals(True)
+        self.bpp_combo.setCurrentIndex(0 if sidecar["bytes_per_pixel"] == 1 else 1)
+        self.bpp_combo.blockSignals(False)
+
+        self.endian_combo.blockSignals(True)
+        self.endian_combo.setCurrentIndex(1 if sidecar["big_endian"] else 0)
+        self.endian_combo.blockSignals(False)
+
+        self.pattern_combo.blockSignals(True)
+        self.pattern_combo.setCurrentIndex(BAYER_PATTERNS.index(sidecar["pattern"]))
+        self.pattern_combo.blockSignals(False)
+
+        self.auto_height_check.blockSignals(True)
+        self.auto_height_check.setChecked(False)
+        self.auto_height_check.blockSignals(False)
+
+
+def _numpy_to_qimage(arr: np.ndarray) -> QImage:
+    arr = np.ascontiguousarray(arr)
+    height, width = arr.shape[:2]
+    if arr.ndim == 2:
+        qimage = QImage(arr.data, width, height, width, QImage.Format_Grayscale8)
+    else:
+        qimage = QImage(arr.data, width, height, width * 3, QImage.Format_RGB888)
+    return qimage.copy()
