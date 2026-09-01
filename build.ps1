@@ -2,6 +2,6 @@
 # Usage: ./build.ps1
 # Output: dist/RawImageViewer.exe (single file, no installer needed)
 
-pyinstaller --noconfirm --onefile --windowed --name "RawImageViewer" main.py
+uv run --group dev pyinstaller --noconfirm --onefile --windowed --name "RawImageViewer" main.py
 
 Write-Host "Executable created at dist\RawImageViewer.exe"

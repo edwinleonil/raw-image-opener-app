@@ -16,15 +16,15 @@ Bayer demosaicing (RGGB / BGGR / GRBG / GBRG) to a full-color image.
 
 ## Run from source
 
+Requires [uv](https://docs.astral.sh/uv/).
+
 ```
-pip install -r requirements.txt
-python main.py
+uv run main.py
 ```
 
 ## Build a standalone Windows executable
 
 ```
-pip install -r requirements.txt pyinstaller
 ./build.ps1
 ```
 

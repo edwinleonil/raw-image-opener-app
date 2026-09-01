@@ -1,0 +1,19 @@
+[project]
+name = "raw-image-opener-app"
+version = "0.1.0"
+description = "A small desktop viewer for headerless .raw sensor dumps"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.5",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller",
+]
+
+[tool.uv]
+package = false
