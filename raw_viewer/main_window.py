@@ -121,6 +121,11 @@ class MainWindow(QMainWindow):
         open_button.clicked.connect(self.open_folder)
         panel.addWidget(open_button)
 
+        self.folder_label = QLabel("No folder selected")
+        self.folder_label.setWordWrap(True)
+        self.folder_label.setStyleSheet("color: #888888;")
+        panel.addWidget(self.folder_label)
+
         format_box = QGroupBox("Raw format")
         form = QFormLayout(format_box)
 
@@ -265,6 +270,8 @@ class MainWindow(QMainWindow):
         self.folder = folder
         self.files = files
         self.index = 0 if files else -1
+        self.folder_label.setText(f"Folder: {folder.name}")
+        self.folder_label.setToolTip(str(folder))
         self._save_settings()
         if not files:
             self.image_label.clear_image(f"No .raw files found in:\n{folder}")
