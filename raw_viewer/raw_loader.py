@@ -145,6 +145,16 @@ def _debayer(bayer: np.ndarray, pattern: str) -> np.ndarray:
     return cv2.cvtColor(bayer, _BAYER_CV_CODES[pattern])
 
 
+def rotate_image(array: np.ndarray, degrees: int) -> np.ndarray:
+    """Rotate an image array clockwise by `degrees`, a multiple of 90."""
+    degrees %= 360
+    if degrees == 0:
+        return array
+    # np.rot90's k rotates counter-clockwise, so invert to get clockwise degrees.
+    k = (360 - degrees) // 90
+    return np.ascontiguousarray(np.rot90(array, k=k))
+
+
 def _normalize_to_8bit(array: np.ndarray, norm_mode: str) -> np.ndarray:
     if array.dtype == np.uint8 and norm_mode == "8-bit (0-255)":
         return array

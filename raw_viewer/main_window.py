@@ -28,11 +28,13 @@ from .raw_loader import (
     RawFormatError,
     load_sidecar_metadata,
     process_raw_file,
+    rotate_image,
 )
 
 ORG_NAME = "RawImageOpener"
 APP_NAME = "RawImageViewer"
 RAW_EXTENSIONS = {".raw"}
+ROTATION_OPTIONS = [("0°", 0), ("90° CW", 90), ("180°", 180), ("90° CCW (-90°)", 270)]
 
 
 class ImageLabel(QLabel):
@@ -165,6 +167,13 @@ class MainWindow(QMainWindow):
 
         panel.addWidget(format_box)
 
+        rotation_box = QGroupBox("Rotation")
+        rotation_form = QFormLayout(rotation_box)
+        self.rotation_combo = QComboBox()
+        self.rotation_combo.addItems([label for label, _ in ROTATION_OPTIONS])
+        rotation_form.addRow("Angle", self.rotation_combo)
+        panel.addWidget(rotation_box)
+
         self.sidecar_label = QLabel("")
         self.sidecar_label.setWordWrap(True)
         self.sidecar_label.setStyleSheet("color: #2e7d32;")
@@ -199,6 +208,7 @@ class MainWindow(QMainWindow):
             self.endian_combo.currentIndexChanged,
             self.pattern_combo.currentIndexChanged,
             self.norm_combo.currentIndexChanged,
+            self.rotation_combo.currentIndexChanged,
         ):
             signal.connect(self._on_format_changed)
 
@@ -220,6 +230,7 @@ class MainWindow(QMainWindow):
             int(s.value("pattern_index", BAYER_PATTERNS.index("RGGB")))
         )
         self.norm_combo.setCurrentIndex(int(s.value("norm_index", 0)))
+        self.rotation_combo.setCurrentIndex(int(s.value("rotation_index", 0)))
         last_folder = s.value("last_folder", "")
         if last_folder and Path(last_folder).is_dir():
             self._set_folder(Path(last_folder))
@@ -233,6 +244,7 @@ class MainWindow(QMainWindow):
         s.setValue("endian_index", self.endian_combo.currentIndex())
         s.setValue("pattern_index", self.pattern_combo.currentIndex())
         s.setValue("norm_index", self.norm_combo.currentIndex())
+        s.setValue("rotation_index", self.rotation_combo.currentIndex())
         if self.folder:
             s.setValue("last_folder", str(self.folder))
 
@@ -326,6 +338,10 @@ class MainWindow(QMainWindow):
             self.height_spin.blockSignals(True)
             self.height_spin.setValue(resolved_height)
             self.height_spin.blockSignals(False)
+
+        rotation_degrees = ROTATION_OPTIONS[self.rotation_combo.currentIndex()][1]
+        if rotation_degrees:
+            image8 = rotate_image(image8, rotation_degrees)
 
         qimage = _numpy_to_qimage(image8)
         self.image_label.set_image(QPixmap.fromImage(qimage))
