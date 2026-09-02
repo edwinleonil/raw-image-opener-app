@@ -1,10 +1,21 @@
 """Small reusable Qt widgets/helpers shared across tabs."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
-from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
-from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QSizePolicy
+from PySide6.QtCore import QLineF, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QGraphicsEllipseItem,
+    QGraphicsItem,
+    QGraphicsLineItem,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsSimpleTextItem,
+    QGraphicsView,
+    QSizePolicy,
+)
 
 
 def numpy_to_qimage(arr: np.ndarray) -> QImage:
@@ -18,6 +29,30 @@ def numpy_to_qimage(arr: np.ndarray) -> QImage:
     return qimage.copy()
 
 
+@dataclass(frozen=True)
+class Measurement:
+    """A completed two-point pixel measurement, in image-pixel coordinates."""
+
+    p1: QPoint
+    p2: QPoint
+    distance_px: float
+
+
+class _MeasurementOverlay:
+    """Tracks the scene items that make up one on-canvas measurement."""
+
+    def __init__(self, line_item, marker_a, marker_b, text_item, measurement: Measurement):
+        self.line_item = line_item
+        self.marker_a = marker_a
+        self.marker_b = marker_b
+        self.text_item = text_item
+        self.measurement = measurement
+
+    def remove_from_scene(self, scene: QGraphicsScene) -> None:
+        for item in (self.line_item, self.marker_a, self.marker_b, self.text_item):
+            scene.removeItem(item)
+
+
 class ZoomableImageView(QGraphicsView):
     """An image viewer with mouse-wheel zoom and click-drag panning.
 
@@ -27,10 +62,15 @@ class ZoomableImageView(QGraphicsView):
     """
 
     zoom_changed = Signal(int)  # current zoom, as a percentage
+    measurement_added = Signal(object)  # emits a Measurement when a pair completes
+    measurements_cleared = Signal()
 
     MIN_ZOOM = 0.05
     MAX_ZOOM = 32.0
     ZOOM_STEP = 1.15
+
+    PENDING_MARKER_COLOR = QColor("#ffb300")
+    MEASUREMENT_COLOR = QColor("#00e5ff")
 
     def __init__(self):
         super().__init__()
@@ -40,6 +80,12 @@ class ZoomableImageView(QGraphicsView):
         self._scene.addItem(self._pixmap_item)
         self._has_image = False
         self._placeholder_text = ""
+
+        self._measure_mode = False
+        self._pending_point: QPoint | None = None
+        self._pending_marker: QGraphicsEllipseItem | None = None
+        self._measurements: list[_MeasurementOverlay] = []
+        self._saved_drag_mode = QGraphicsView.ScrollHandDrag
 
         self.setRenderHint(QPainter.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
@@ -51,6 +97,8 @@ class ZoomableImageView(QGraphicsView):
 
     # ---------- content ----------
     def set_image(self, pixmap: QPixmap, reset_view: bool = True) -> None:
+        if reset_view:
+            self.clear_measurements()
         self._pixmap_item.setPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
         self._has_image = True
@@ -61,6 +109,7 @@ class ZoomableImageView(QGraphicsView):
         self.viewport().update()
 
     def clear_image(self, text: str = "") -> None:
+        self.clear_measurements()
         self._pixmap_item.setPixmap(QPixmap())
         self._scene.setSceneRect(QRectF())
         self._has_image = False
@@ -111,6 +160,94 @@ class ZoomableImageView(QGraphicsView):
 
     def _emit_zoom_changed(self) -> None:
         self.zoom_changed.emit(self.current_zoom_percent())
+
+    # ---------- measure ----------
+    def set_measure_mode(self, enabled: bool) -> None:
+        if enabled == self._measure_mode:
+            return
+        self._measure_mode = enabled
+        if enabled:
+            self._saved_drag_mode = self.dragMode()
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setDragMode(self._saved_drag_mode)
+            self.unsetCursor()
+            self._cancel_pending_point()
+
+    def clear_measurements(self) -> None:
+        self._cancel_pending_point()
+        for overlay in self._measurements:
+            overlay.remove_from_scene(self._scene)
+        self._measurements.clear()
+        self.measurements_cleared.emit()
+
+    def mousePressEvent(self, event) -> None:
+        if self._measure_mode and self._has_image and event.button() == Qt.LeftButton:
+            self._handle_measure_click(event)
+            return
+        super().mousePressEvent(event)
+
+    def _handle_measure_click(self, event) -> None:
+        scene_pos = self.mapToScene(event.position().toPoint())
+        pixel_point = QPoint(round(scene_pos.x()), round(scene_pos.y()))
+        if not self._pixmap_item.pixmap().rect().contains(pixel_point):
+            return
+
+        if self._pending_point is None:
+            self._pending_point = pixel_point
+            self._pending_marker = self._make_marker(pixel_point, self.PENDING_MARKER_COLOR)
+            return
+
+        if pixel_point == self._pending_point:
+            return
+
+        p1 = self._pending_point
+        self._cancel_pending_point()
+        overlay = self._create_measurement_overlay(p1, pixel_point)
+        self._measurements.append(overlay)
+        self.measurement_added.emit(overlay.measurement)
+
+    def _cancel_pending_point(self) -> None:
+        if self._pending_marker is not None:
+            self._scene.removeItem(self._pending_marker)
+        self._pending_marker = None
+        self._pending_point = None
+
+    def _make_marker(self, point: QPoint, color: QColor) -> QGraphicsEllipseItem:
+        marker = QGraphicsEllipseItem(QRectF(-4, -4, 8, 8))
+        marker.setPos(QPointF(point))
+        marker.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        marker.setBrush(color)
+        marker.setPen(QPen(Qt.black, 1))
+        marker.setZValue(12)
+        self._scene.addItem(marker)
+        return marker
+
+    def _create_measurement_overlay(self, p1: QPoint, p2: QPoint) -> _MeasurementOverlay:
+        distance = QLineF(QPointF(p1), QPointF(p2)).length()
+
+        pen = QPen(self.MEASUREMENT_COLOR, 2)
+        pen.setCosmetic(True)
+        line_item = QGraphicsLineItem(QLineF(QPointF(p1), QPointF(p2)))
+        line_item.setPen(pen)
+        line_item.setZValue(10)
+        self._scene.addItem(line_item)
+
+        marker_a = self._make_marker(p1, self.MEASUREMENT_COLOR)
+        marker_b = self._make_marker(p2, self.MEASUREMENT_COLOR)
+
+        midpoint = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+        text_item = QGraphicsSimpleTextItem(f"{distance:.1f} px")
+        text_item.setBrush(self.MEASUREMENT_COLOR)
+        text_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        text_item.setPos(midpoint)
+        text_item.setZValue(11)
+        self._scene.addItem(text_item)
+
+        return _MeasurementOverlay(
+            line_item, marker_a, marker_b, text_item, Measurement(p1, p2, distance)
+        )
 
     # ---------- placeholder ----------
     def paintEvent(self, event) -> None:

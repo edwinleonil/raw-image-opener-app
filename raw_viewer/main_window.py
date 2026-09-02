@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QMainWindow,
     QPushButton,
     QSlider,
@@ -53,6 +54,7 @@ class MainWindow(QMainWindow):
         self.files: list[Path] = []
         self.index: int = -1
         self._last_rendered_path: Path | None = None
+        self._measurement_count: int = 0
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
@@ -73,6 +75,8 @@ class MainWindow(QMainWindow):
         self.image_label = ZoomableImageView()
         self.image_label.clear_image("Open a folder to begin")
         self.image_label.zoom_changed.connect(self._on_zoom_changed)
+        self.image_label.measurement_added.connect(self._on_measurement_added)
+        self.image_label.measurements_cleared.connect(self._on_measurements_cleared)
         left.addWidget(self.image_label, stretch=1)
 
         zoom_bar = QHBoxLayout()
@@ -98,6 +102,11 @@ class MainWindow(QMainWindow):
         actual_size_button = QPushButton("100%")
         actual_size_button.clicked.connect(self.image_label.zoom_actual_size)
         zoom_bar.addWidget(actual_size_button)
+
+        self.measure_button = QPushButton("Measure")
+        self.measure_button.setCheckable(True)
+        self.measure_button.toggled.connect(self.image_label.set_measure_mode)
+        zoom_bar.addWidget(self.measure_button)
 
         zoom_bar.addStretch(1)
         left.addLayout(zoom_bar)
@@ -232,6 +241,19 @@ class MainWindow(QMainWindow):
 
         panel.addWidget(adjustments_box)
 
+        measure_box = QGroupBox("Measure")
+        measure_layout = QVBoxLayout(measure_box)
+
+        self.measurements_list = QListWidget()
+        self.measurements_list.setMaximumHeight(120)
+        measure_layout.addWidget(self.measurements_list)
+
+        self.clear_measurements_button = QPushButton("Clear All")
+        self.clear_measurements_button.clicked.connect(self.image_label.clear_measurements)
+        measure_layout.addWidget(self.clear_measurements_button)
+
+        panel.addWidget(measure_box)
+
         self.sidecar_label = QLabel("")
         self.sidecar_label.setWordWrap(True)
         self.sidecar_label.setStyleSheet("color: #2e7d32;")
@@ -275,6 +297,14 @@ class MainWindow(QMainWindow):
             self.sharpness_slider.valueChanged,
         ):
             signal.connect(self._on_format_changed)
+
+        for signal in (
+            self.width_spin.valueChanged,
+            self.height_spin.valueChanged,
+            self.auto_height_check.toggled,
+            self.rotation_combo.currentIndexChanged,
+        ):
+            signal.connect(lambda *_: self.image_label.clear_measurements())
 
         self.auto_height_check.toggled.connect(self._on_auto_height_toggled)
 
@@ -374,6 +404,19 @@ class MainWindow(QMainWindow):
     def _on_reset_adjustments(self) -> None:
         for slider in (self.brightness_slider, self.contrast_slider, self.sharpness_slider):
             slider.setValue(0)
+
+    def _on_measurement_added(self, measurement) -> None:
+        self._measurement_count += 1
+        p1, p2, dist = measurement.p1, measurement.p2, measurement.distance_px
+        text = (
+            f"{self._measurement_count}: ({p1.x()},{p1.y()}) → "
+            f"({p2.x()},{p2.y()}) = {dist:.1f} px"
+        )
+        self.measurements_list.addItem(text)
+
+    def _on_measurements_cleared(self) -> None:
+        self.measurements_list.clear()
+        self._measurement_count = 0
 
     def _current_format(self):
         bytes_per_pixel = 1 if self.bpp_combo.currentIndex() == 0 else 2
