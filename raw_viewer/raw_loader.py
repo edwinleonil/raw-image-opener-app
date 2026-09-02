@@ -155,6 +155,36 @@ def rotate_image(array: np.ndarray, degrees: int) -> np.ndarray:
     return np.ascontiguousarray(np.rot90(array, k=k))
 
 
+def adjust_brightness_contrast(image: np.ndarray, brightness: int, contrast: int) -> np.ndarray:
+    """Apply brightness/contrast to an 8-bit image.
+
+    brightness: -100..100, added directly to every pixel value (beta).
+    contrast: -100..100, mapped to a multiplicative factor
+    alpha = 1.0 + contrast/100.0 (0 -> 100%/no change, -100 -> 0%, 100 -> 200%).
+    """
+    if brightness == 0 and contrast == 0:
+        return image
+    import cv2
+
+    alpha = 1.0 + (contrast / 100.0)
+    return cv2.convertScaleAbs(image, alpha=alpha, beta=float(brightness))
+
+
+def sharpen_image(image: np.ndarray, amount: int) -> np.ndarray:
+    """Apply unsharp-mask sharpening to an 8-bit image.
+
+    amount: 0..100 (0 = no-op). Maps to a blend strength of 0.0..1.5 applied
+    as: image + strength * (image - gaussian_blur(image)).
+    """
+    if amount <= 0:
+        return image
+    import cv2
+
+    blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    strength = (amount / 100.0) * 1.5
+    return cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
+
+
 def _normalize_to_8bit(array: np.ndarray, norm_mode: str) -> np.ndarray:
     if array.dtype == np.uint8 and norm_mode == "8-bit (0-255)":
         return array

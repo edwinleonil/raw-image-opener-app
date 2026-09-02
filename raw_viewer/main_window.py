@@ -3,9 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 from PySide6.QtCore import Qt, QSettings, QTimer
-from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -16,57 +15,30 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
-    QSizePolicy,
+    QSlider,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from .hdr_tab import HdrBurstTab
 from .raw_loader import (
     BAYER_PATTERNS,
     NORMALIZATION_MODES,
     RawFormatError,
+    adjust_brightness_contrast,
     load_sidecar_metadata,
     process_raw_file,
     rotate_image,
+    sharpen_image,
 )
+from .widgets import ZoomableImageView, numpy_to_qimage
 
 ORG_NAME = "RawImageOpener"
 APP_NAME = "RawImageViewer"
 RAW_EXTENSIONS = {".raw"}
 ROTATION_OPTIONS = [("0°", 0), ("90° CW", 90), ("180°", 180), ("90° CCW (-90°)", 270)]
-
-
-class ImageLabel(QLabel):
-    """A QLabel that keeps its pixmap scaled to fit while preserving aspect ratio."""
-
-    def __init__(self):
-        super().__init__()
-        self._original_pixmap: QPixmap | None = None
-        self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(200, 200)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setStyleSheet("background-color: #202020; color: #aaaaaa;")
-
-    def set_image(self, pixmap: QPixmap) -> None:
-        self._original_pixmap = pixmap
-        self._rescale()
-
-    def clear_image(self, text: str = "") -> None:
-        self._original_pixmap = None
-        self.setText(text)
-
-    def _rescale(self) -> None:
-        if self._original_pixmap is None:
-            return
-        scaled = self._original_pixmap.scaled(
-            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self.setPixmap(scaled)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._rescale()
 
 
 class MainWindow(QMainWindow):
@@ -80,6 +52,7 @@ class MainWindow(QMainWindow):
         self.folder: Path | None = None
         self.files: list[Path] = []
         self.index: int = -1
+        self._last_rendered_path: Path | None = None
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
@@ -97,9 +70,37 @@ class MainWindow(QMainWindow):
         root = QHBoxLayout(central)
 
         left = QVBoxLayout()
-        self.image_label = ImageLabel()
-        self.image_label.setText("Open a folder to begin")
+        self.image_label = ZoomableImageView()
+        self.image_label.clear_image("Open a folder to begin")
+        self.image_label.zoom_changed.connect(self._on_zoom_changed)
         left.addWidget(self.image_label, stretch=1)
+
+        zoom_bar = QHBoxLayout()
+        zoom_out_button = QPushButton("−")
+        zoom_out_button.setFixedWidth(28)
+        zoom_out_button.clicked.connect(self.image_label.zoom_out)
+        zoom_bar.addWidget(zoom_out_button)
+
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        self.zoom_label.setFixedWidth(50)
+        zoom_bar.addWidget(self.zoom_label)
+
+        zoom_in_button = QPushButton("+")
+        zoom_in_button.setFixedWidth(28)
+        zoom_in_button.clicked.connect(self.image_label.zoom_in)
+        zoom_bar.addWidget(zoom_in_button)
+
+        fit_button = QPushButton("Fit")
+        fit_button.clicked.connect(self.image_label.fit_to_window)
+        zoom_bar.addWidget(fit_button)
+
+        actual_size_button = QPushButton("100%")
+        actual_size_button.clicked.connect(self.image_label.zoom_actual_size)
+        zoom_bar.addWidget(actual_size_button)
+
+        zoom_bar.addStretch(1)
+        left.addLayout(zoom_bar)
 
         nav_bar = QHBoxLayout()
         self.prev_button = QPushButton("◀ Previous")
@@ -179,6 +180,58 @@ class MainWindow(QMainWindow):
         rotation_form.addRow("Angle", self.rotation_combo)
         panel.addWidget(rotation_box)
 
+        adjustments_box = QGroupBox("Adjustments")
+        adjustments_form = QFormLayout(adjustments_box)
+
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.brightness_slider.setRange(-100, 100)
+        self.brightness_slider.setValue(0)
+        self.brightness_value_label = QLabel("0")
+        self.brightness_value_label.setFixedWidth(40)
+        self.brightness_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        brightness_row = QHBoxLayout()
+        brightness_row.addWidget(self.brightness_slider)
+        brightness_row.addWidget(self.brightness_value_label)
+        adjustments_form.addRow("Brightness", brightness_row)
+
+        self.contrast_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider.setRange(-100, 100)
+        self.contrast_slider.setValue(0)
+        self.contrast_value_label = QLabel("100%")
+        self.contrast_value_label.setFixedWidth(40)
+        self.contrast_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        contrast_row = QHBoxLayout()
+        contrast_row.addWidget(self.contrast_slider)
+        contrast_row.addWidget(self.contrast_value_label)
+        adjustments_form.addRow("Contrast", contrast_row)
+
+        self.sharpness_slider = QSlider(Qt.Horizontal)
+        self.sharpness_slider.setRange(0, 100)
+        self.sharpness_slider.setValue(0)
+        self.sharpness_value_label = QLabel("0")
+        self.sharpness_value_label.setFixedWidth(40)
+        self.sharpness_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        sharpness_row = QHBoxLayout()
+        sharpness_row.addWidget(self.sharpness_slider)
+        sharpness_row.addWidget(self.sharpness_value_label)
+        adjustments_form.addRow("Sharpness", sharpness_row)
+
+        self.brightness_slider.valueChanged.connect(
+            lambda v: self.brightness_value_label.setText(str(v))
+        )
+        self.contrast_slider.valueChanged.connect(
+            lambda v: self.contrast_value_label.setText(f"{v + 100}%")
+        )
+        self.sharpness_slider.valueChanged.connect(
+            lambda v: self.sharpness_value_label.setText(str(v))
+        )
+
+        self.adjustments_reset_button = QPushButton("Reset")
+        self.adjustments_reset_button.clicked.connect(self._on_reset_adjustments)
+        adjustments_form.addRow("", self.adjustments_reset_button)
+
+        panel.addWidget(adjustments_box)
+
         self.sidecar_label = QLabel("")
         self.sidecar_label.setWordWrap(True)
         self.sidecar_label.setStyleSheet("color: #2e7d32;")
@@ -204,7 +257,10 @@ class MainWindow(QMainWindow):
 
         root.addLayout(panel, stretch=1)
 
-        self.setCentralWidget(central)
+        tabs = QTabWidget()
+        tabs.addTab(central, "Viewer")
+        tabs.addTab(HdrBurstTab(), "HDR / Burst Stacking")
+        self.setCentralWidget(tabs)
 
         for signal in (
             self.width_spin.valueChanged,
@@ -214,6 +270,9 @@ class MainWindow(QMainWindow):
             self.pattern_combo.currentIndexChanged,
             self.norm_combo.currentIndexChanged,
             self.rotation_combo.currentIndexChanged,
+            self.brightness_slider.valueChanged,
+            self.contrast_slider.valueChanged,
+            self.sharpness_slider.valueChanged,
         ):
             signal.connect(self._on_format_changed)
 
@@ -236,6 +295,9 @@ class MainWindow(QMainWindow):
         )
         self.norm_combo.setCurrentIndex(int(s.value("norm_index", 0)))
         self.rotation_combo.setCurrentIndex(int(s.value("rotation_index", 0)))
+        self.brightness_slider.setValue(int(s.value("brightness", 0)))
+        self.contrast_slider.setValue(int(s.value("contrast", 0)))
+        self.sharpness_slider.setValue(int(s.value("sharpness", 0)))
         last_folder = s.value("last_folder", "")
         if last_folder and Path(last_folder).is_dir():
             self._set_folder(Path(last_folder))
@@ -250,6 +312,9 @@ class MainWindow(QMainWindow):
         s.setValue("pattern_index", self.pattern_combo.currentIndex())
         s.setValue("norm_index", self.norm_combo.currentIndex())
         s.setValue("rotation_index", self.rotation_combo.currentIndex())
+        s.setValue("brightness", self.brightness_slider.value())
+        s.setValue("contrast", self.contrast_slider.value())
+        s.setValue("sharpness", self.sharpness_slider.value())
         if self.folder:
             s.setValue("last_folder", str(self.folder))
 
@@ -303,6 +368,13 @@ class MainWindow(QMainWindow):
     def _on_format_changed(self) -> None:
         self._refresh_timer.start()
 
+    def _on_zoom_changed(self, percent: int) -> None:
+        self.zoom_label.setText(f"{percent}%")
+
+    def _on_reset_adjustments(self) -> None:
+        for slider in (self.brightness_slider, self.contrast_slider, self.sharpness_slider):
+            slider.setValue(0)
+
     def _current_format(self):
         bytes_per_pixel = 1 if self.bpp_combo.currentIndex() == 0 else 2
         big_endian = self.endian_combo.currentIndex() == 1
@@ -312,11 +384,20 @@ class MainWindow(QMainWindow):
         height = None if self.auto_height_check.isChecked() else self.height_spin.value()
         return width, height, bytes_per_pixel, big_endian, pattern, norm_mode
 
+    def _current_adjustments(self) -> tuple[int, int, int]:
+        return (
+            self.brightness_slider.value(),
+            self.contrast_slider.value(),
+            self.sharpness_slider.value(),
+        )
+
     # ---------- rendering ----------
     def _render_current(self) -> None:
         if self.index < 0 or self.index >= len(self.files):
             return
         path = self.files[self.index]
+        is_new_image = path != self._last_rendered_path
+        self._last_rendered_path = path
         norm_mode = self.norm_combo.currentText()
 
         sidecar = load_sidecar_metadata(path)
@@ -346,12 +427,18 @@ class MainWindow(QMainWindow):
             self.height_spin.setValue(resolved_height)
             self.height_spin.blockSignals(False)
 
+        brightness, contrast, sharpness = self._current_adjustments()
+        if brightness or contrast:
+            image8 = adjust_brightness_contrast(image8, brightness, contrast)
+        if sharpness:
+            image8 = sharpen_image(image8, sharpness)
+
         rotation_degrees = ROTATION_OPTIONS[self.rotation_combo.currentIndex()][1]
         if rotation_degrees:
             image8 = rotate_image(image8, rotation_degrees)
 
-        qimage = _numpy_to_qimage(image8)
-        self.image_label.set_image(QPixmap.fromImage(qimage))
+        qimage = numpy_to_qimage(image8)
+        self.image_label.set_image(QPixmap.fromImage(qimage), reset_view=is_new_image)
         self.status_label.setText(f"{self.index + 1} / {len(self.files)} — {path.name}")
         self._update_nav_state()
 
@@ -392,13 +479,3 @@ class MainWindow(QMainWindow):
         self.auto_height_check.blockSignals(True)
         self.auto_height_check.setChecked(False)
         self.auto_height_check.blockSignals(False)
-
-
-def _numpy_to_qimage(arr: np.ndarray) -> QImage:
-    arr = np.ascontiguousarray(arr)
-    height, width = arr.shape[:2]
-    if arr.ndim == 2:
-        qimage = QImage(arr.data, width, height, width, QImage.Format_Grayscale8)
-    else:
-        qimage = QImage(arr.data, width, height, width * 3, QImage.Format_RGB888)
-    return qimage.copy()
