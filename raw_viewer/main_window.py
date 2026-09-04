@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMainWindow,
     QPushButton,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from .hdr_tab import HdrBurstTab
+from .overlap_tab import OverlapTab
 from .raw_loader import (
     BAYER_PATTERNS,
     NORMALIZATION_MODES,
@@ -135,6 +137,17 @@ class MainWindow(QMainWindow):
         self.folder_label.setWordWrap(True)
         self.folder_label.setStyleSheet("color: #888888;")
         panel.addWidget(self.folder_label)
+
+        file_path_row = QHBoxLayout()
+        self.file_path_edit = QLineEdit()
+        self.file_path_edit.setPlaceholderText("Or enter a path to a single image file…")
+        self.file_path_edit.returnPressed.connect(self._load_typed_file_path)
+        file_path_row.addWidget(self.file_path_edit, stretch=1)
+
+        browse_file_button = QPushButton("Browse…")
+        browse_file_button.clicked.connect(self._browse_for_file)
+        file_path_row.addWidget(browse_file_button)
+        panel.addLayout(file_path_row)
 
         format_box = QGroupBox("Raw format")
         form = QFormLayout(format_box)
@@ -282,6 +295,8 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(central, "Viewer")
         tabs.addTab(HdrBurstTab(), "HDR / Burst Stacking")
+        self.overlap_tab = OverlapTab()
+        tabs.addTab(self.overlap_tab, "Overlap Measurement")
         self.setCentralWidget(tabs)
 
         for signal in (
@@ -358,6 +373,31 @@ class MainWindow(QMainWindow):
         if folder:
             self._set_folder(Path(folder))
 
+    def _browse_for_file(self) -> None:
+        file, _ = QFileDialog.getOpenFileName(
+            self, "Select image file", "", "Raw images (*.raw);;All files (*)"
+        )
+        if file:
+            self.file_path_edit.setText(file)
+            self._load_file_path(Path(file))
+
+    def _load_typed_file_path(self) -> None:
+        text = self.file_path_edit.text().strip()
+        if text:
+            self._load_file_path(Path(text))
+
+    def _load_file_path(self, path: Path) -> None:
+        path = Path(str(path).strip('"')).expanduser()
+        if not path.is_file():
+            self.error_label.setText(f"File not found: {path}")
+            return
+        self.files = [path]
+        self.index = 0
+        self.folder_label.setText(f"File: {path.name}")
+        self.folder_label.setToolTip(str(path))
+        self._save_settings()
+        self._render_current()
+
     def _set_folder(self, folder: Path) -> None:
         files = sorted(
             p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in RAW_EXTENSIONS
@@ -367,6 +407,7 @@ class MainWindow(QMainWindow):
         self.index = 0 if files else -1
         self.folder_label.setText(f"Folder: {folder.name}")
         self.folder_label.setToolTip(str(folder))
+        self.overlap_tab.set_available_files(files)
         self._save_settings()
         if not files:
             self.image_label.clear_image(f"No .raw files found in:\n{folder}")
