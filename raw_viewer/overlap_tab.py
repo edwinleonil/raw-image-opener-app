@@ -18,6 +18,10 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
+    QGraphicsItem,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -26,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .overlap_processing import (
+    MANUAL_ALIGN_LOW_CONFIDENCE_THRESHOLD,
     OverlapCancelled,
     OverlapImage,
     OverlapResult,
@@ -37,16 +42,21 @@ from .widgets import ZoomableImageView, numpy_to_qimage
 
 THUMBNAIL_SIZE = 140
 
-# Same options/order as MainWindow's rotation control (main_window.py) - both
-# images are rotated the same way before alignment, for rigs whose sensor
-# orientation doesn't match the physical scene (e.g. a portrait-mounted
-# camera). Alignment itself makes no horizontal/vertical assumption, so this
-# is purely a preprocessing convenience, not a requirement.
-ROTATION_OPTIONS = [("None", 0), ("90° CW", 90), ("180°", 180), ("90° CCW", 270)]
+# The rig this tab is used with mounts the camera 90 degrees from the
+# checkerboard's natural orientation, so every loaded image is rotated
+# clockwise by this fixed amount, once, at load time - see
+# _ImageSlot._on_selection_changed.
+FIXED_ROTATION_DEGREES = 90
+
+_PLACEHOLDER_TEXT = "Load two .raw images below to begin manual alignment"
 
 
 class _ImageSlot(QWidget):
-    """One image slot: a dropdown over the Viewer tab's current folder, plus a thumbnail."""
+    """One image slot: a dropdown over the Viewer tab's current folder, plus a thumbnail.
+
+    Every loaded image is rotated FIXED_ROTATION_DEGREES clockwise once here
+    before being previewed or cached for compute - see _on_selection_changed.
+    """
 
     item_changed = Signal()
     selection_failed = Signal(str)
@@ -109,6 +119,7 @@ class _ImageSlot(QWidget):
             self.clear()
             self.selection_failed.emit(str(exc))
             return
+        item.image = rotate_image(item.image, FIXED_ROTATION_DEGREES)
         self.set_item(item)
 
     def set_item(self, item: OverlapImage) -> None:
@@ -127,28 +138,111 @@ class _ImageSlot(QWidget):
         self.item_changed.emit()
 
 
+class _ManualAlignView(QGraphicsView):
+    """Fixed base image (image 1) plus a draggable, ~50%-opacity overlay (image 2).
+
+    The primary alignment input surface: the starting point for
+    align_with_manual_guess's local pixel-correlation refinement - not a
+    general-purpose viewer, so it's kept separate from the shared
+    ZoomableImageView (which has different, single-pixmap pan/zoom semantics
+    used by other tabs).
+    """
+
+    OVERLAY_OPACITY = 0.5
+    NUDGE_STEP_PX = 1
+    NUDGE_STEP_PX_SHIFT = 10
+    MIN_ZOOM = 0.05
+    MAX_ZOOM = 8.0
+    ZOOM_STEP = 1.15
+
+    def __init__(self):
+        super().__init__()
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._base_item = QGraphicsPixmapItem()
+        self._base_item.setZValue(0)
+        self._overlay_item = QGraphicsPixmapItem()
+        self._overlay_item.setZValue(1)
+        self._overlay_item.setOpacity(self.OVERLAY_OPACITY)
+        self._overlay_item.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self._scene.addItem(self._base_item)
+        self._scene.addItem(self._overlay_item)
+
+        self.setDragMode(QGraphicsView.NoDrag)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setBackgroundBrush(Qt.black)
+        self.setMinimumSize(200, 200)
+
+    def set_images(self, pixmap1: QPixmap, pixmap2: QPixmap) -> None:
+        self._base_item.setPixmap(pixmap1)
+        self._base_item.setPos(0, 0)
+        self._overlay_item.setPixmap(pixmap2)
+        self._overlay_item.setPos((pixmap1.width() - pixmap2.width()) / 2, (pixmap1.height() - pixmap2.height()) / 2)
+        self._scene.setSceneRect(self._scene.itemsBoundingRect())
+        self.resetTransform()
+        self.fitInView(self._scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+        self.setFocus()
+
+    def manual_offset(self) -> tuple[float, float]:
+        pos = self._overlay_item.pos()
+        return pos.x(), pos.y()
+
+    def wheelEvent(self, event) -> None:
+        factor = self.ZOOM_STEP if event.angleDelta().y() > 0 else 1.0 / self.ZOOM_STEP
+        current = self.transform().m11()
+        if current <= 0:
+            return
+        target = max(self.MIN_ZOOM, min(self.MAX_ZOOM, current * factor))
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.scale(target / current, target / current)
+
+    def keyPressEvent(self, event) -> None:
+        step_map = {
+            Qt.Key_Left: (-1, 0),
+            Qt.Key_Right: (1, 0),
+            Qt.Key_Up: (0, -1),
+            Qt.Key_Down: (0, 1),
+        }
+        direction = step_map.get(event.key())
+        if direction is None:
+            super().keyPressEvent(event)
+            return
+        step = self.NUDGE_STEP_PX_SHIFT if event.modifiers() & Qt.ShiftModifier else self.NUDGE_STEP_PX
+        self._overlay_item.moveBy(direction[0] * step, direction[1] * step)
+
+
 class _OverlapWorker(QObject):
     """Runs merge_and_measure_overlap on a background thread.
 
     Keeps the UI thread free to repaint and respond to the Stop button while
-    checkerboard detection/alignment (potentially the slowest part, trying
-    many candidate pattern sizes) is running.
+    checkerboard detection (potentially the slowest part, trying many
+    candidate pattern sizes) is running.
     """
 
     finished = Signal(object)  # OverlapResult
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, image1, image2, cancel_event: threading.Event):
+    def __init__(
+        self,
+        image1,
+        image2,
+        cancel_event: threading.Event,
+        manual_guess: tuple[float, float],
+    ):
         super().__init__()
         self._image1 = image1
         self._image2 = image2
         self._cancel_event = cancel_event
+        self._manual_guess = manual_guess
 
     def run(self) -> None:
         try:
             result = merge_and_measure_overlap(
-                self._image1, self._image2, cancel_event=self._cancel_event
+                self._image1,
+                self._image2,
+                self._manual_guess,
+                cancel_event=self._cancel_event,
             )
         except OverlapCancelled:
             self.cancelled.emit()
@@ -159,25 +253,39 @@ class _OverlapWorker(QObject):
 
 
 class OverlapTab(QWidget):
-    """Checkerboard-based overlap measurement between two .raw images."""
+    """Checkerboard-based overlap measurement between two .raw images.
+
+    Manual placement (drag image 2 over image 1) is always the first step;
+    "Confirm & Refine" then runs align_with_manual_guess's local
+    pixel-correlation refinement from that starting point. There is no
+    automatic-alignment path - see align_with_manual_guess's docstring for
+    why a human-supplied starting position is more robust here than
+    feature-based methods.
+    """
 
     def __init__(self):
         super().__init__()
         self._thread: QThread | None = None
         self._worker: _OverlapWorker | None = None
         self._cancel_event: threading.Event | None = None
+        self._has_result = False
         self._build_ui()
-        self._update_compute_state()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
 
         self.result_label = ZoomableImageView()
-        self.result_label.clear_image("Load two .raw images below, then Compute Overlap")
+        self.result_label.clear_image(_PLACEHOLDER_TEXT)
         self.result_label.zoom_changed.connect(self._on_zoom_changed)
         root.addWidget(self.result_label, stretch=1)
 
-        zoom_row = QHBoxLayout()
+        self.manual_align_view = _ManualAlignView()
+        self.manual_align_view.setVisible(False)
+        root.addWidget(self.manual_align_view, stretch=1)
+
+        self.zoom_row_widget = QWidget()
+        zoom_row = QHBoxLayout(self.zoom_row_widget)
+        zoom_row.setContentsMargins(0, 0, 0, 0)
         zoom_out_button = QPushButton("−")
         zoom_out_button.setFixedWidth(28)
         zoom_out_button.clicked.connect(self.result_label.zoom_out)
@@ -202,25 +310,35 @@ class OverlapTab(QWidget):
         zoom_row.addWidget(actual_size_button)
 
         zoom_row.addStretch(1)
-        root.addLayout(zoom_row)
+        root.addWidget(self.zoom_row_widget)
 
-        compute_row = QHBoxLayout()
-        self.compute_button = QPushButton("Compute Overlap")
-        self.compute_button.clicked.connect(self._on_compute_clicked)
-        compute_row.addWidget(self.compute_button)
-
+        result_controls_row = QHBoxLayout()
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self._on_stop_clicked)
-        compute_row.addWidget(self.stop_button)
+        result_controls_row.addWidget(self.stop_button)
 
-        compute_row.addWidget(QLabel("Rotate before aligning:"))
-        self.rotation_combo = QComboBox()
-        self.rotation_combo.addItems([label for label, _ in ROTATION_OPTIONS])
-        self.rotation_combo.setCurrentIndex(0)  # "None" - verified default; change per-rig if needed
-        compute_row.addWidget(self.rotation_combo)
-        compute_row.addStretch(1)
-        root.addLayout(compute_row)
+        self.realign_button = QPushButton("Re-align")
+        self.realign_button.setVisible(False)
+        self.realign_button.clicked.connect(self._on_realign_clicked)
+        result_controls_row.addWidget(self.realign_button)
+
+        result_controls_row.addStretch(1)
+        root.addLayout(result_controls_row)
+
+        manual_controls_row = QHBoxLayout()
+        self.manual_confirm_button = QPushButton("Confirm && Refine")
+        self.manual_confirm_button.setVisible(False)
+        self.manual_confirm_button.clicked.connect(self._on_manual_confirm_clicked)
+        manual_controls_row.addWidget(self.manual_confirm_button)
+
+        self.manual_cancel_button = QPushButton("Cancel")
+        self.manual_cancel_button.setVisible(False)
+        self.manual_cancel_button.clicked.connect(self._on_manual_cancel_clicked)
+        manual_controls_row.addWidget(self.manual_cancel_button)
+
+        manual_controls_row.addStretch(1)
+        root.addLayout(manual_controls_row)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -233,14 +351,18 @@ class OverlapTab(QWidget):
 
         slots_row = QHBoxLayout()
         self.slot1 = _ImageSlot("Image 1")
-        self.slot1.item_changed.connect(self._update_compute_state)
+        self.slot1.item_changed.connect(self._on_slot_item_changed)
         self.slot1.selection_failed.connect(lambda msg: self._set_status(msg, error=True))
         slots_row.addWidget(self.slot1)
 
         self.slot2 = _ImageSlot("Image 2")
-        self.slot2.item_changed.connect(self._update_compute_state)
+        self.slot2.item_changed.connect(self._on_slot_item_changed)
         self.slot2.selection_failed.connect(lambda msg: self._set_status(msg, error=True))
         slots_row.addWidget(self.slot2)
+
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.clicked.connect(self._on_clear_clicked)
+        slots_row.addWidget(self.clear_button, alignment=Qt.AlignBottom)
 
         slots_row.addStretch(1)
         root.addLayout(slots_row)
@@ -249,23 +371,60 @@ class OverlapTab(QWidget):
     def set_available_files(self, files: list[Path]) -> None:
         self.slot1.set_available_files(files)
         self.slot2.set_available_files(files)
-        self.result_label.clear_image("Load two .raw images below, then Compute Overlap")
+        self._has_result = False
+        self._set_manual_mode(False)
+        self.result_label.clear_image(_PLACEHOLDER_TEXT)
         self.results_label.setText("")
         self._set_status("")
 
-    def _update_compute_state(self) -> None:
-        ready = self.slot1.item is not None and self.slot2.item is not None
-        is_running = self._thread is not None
-        self.compute_button.setEnabled(ready and not is_running)
+    def _on_slot_item_changed(self) -> None:
+        # A new image selection invalidates any prior result and drag position.
+        self._has_result = False
+        both_ready = self.slot1.item is not None and self.slot2.item is not None
+        if both_ready:
+            pixmap1 = QPixmap.fromImage(numpy_to_qimage(self.slot1.item.image))
+            pixmap2 = QPixmap.fromImage(numpy_to_qimage(self.slot2.item.image))
+            self.manual_align_view.set_images(pixmap1, pixmap2)
+            self._set_manual_mode(True)
+        else:
+            self._set_manual_mode(False)
+            self.result_label.clear_image(_PLACEHOLDER_TEXT)
+            self.results_label.setText("")
 
-    # ---------- compute ----------
-    def _on_compute_clicked(self) -> None:
-        degrees = ROTATION_OPTIONS[self.rotation_combo.currentIndex()][1]
-        image1 = rotate_image(self.slot1.item.image, degrees) if degrees else self.slot1.item.image
-        image2 = rotate_image(self.slot2.item.image, degrees) if degrees else self.slot2.item.image
+    def _on_clear_clicked(self) -> None:
+        self.slot1.combo.setCurrentIndex(0)
+        self.slot2.combo.setCurrentIndex(0)
 
+    # ---------- manual align / compute ----------
+    def _on_manual_confirm_clicked(self) -> None:
+        offset = self.manual_align_view.manual_offset()
+        self._set_manual_mode(False)
+        self._run_worker(offset)
+
+    def _on_manual_cancel_clicked(self) -> None:
+        self._set_manual_mode(False)
+
+    def _on_realign_clicked(self) -> None:
+        self._set_manual_mode(True)
+
+    def _set_manual_mode(self, enabled: bool) -> None:
+        self.manual_align_view.setVisible(enabled)
+        self.manual_confirm_button.setVisible(enabled)
+        self.manual_cancel_button.setVisible(enabled)
+        self.result_label.setVisible(not enabled)
+        self.zoom_row_widget.setVisible(not enabled)
+        self.stop_button.setVisible(not enabled)
+        self.realign_button.setVisible(not enabled and self._has_result)
+        # Changing either image mid-drag would leave the drag view showing
+        # stale pixmaps relative to the (now different) cached images.
+        self.slot1.setEnabled(not enabled)
+        self.slot2.setEnabled(not enabled)
+
+    def _run_worker(self, manual_guess: tuple[float, float]) -> None:
         self._cancel_event = threading.Event()
-        self._worker = _OverlapWorker(image1, image2, self._cancel_event)
+        self._worker = _OverlapWorker(
+            self.slot1.item.image, self.slot2.item.image, self._cancel_event, manual_guess
+        )
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
 
@@ -277,8 +436,8 @@ class OverlapTab(QWidget):
         self._worker.failed.connect(self._thread.quit)
         self._worker.cancelled.connect(self._thread.quit)
 
-        self.compute_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.clear_button.setEnabled(False)
         self._set_status("Computing overlap…", error=False)
         self._thread.start()
 
@@ -290,24 +449,35 @@ class OverlapTab(QWidget):
 
     def _on_worker_finished(self, result: OverlapResult) -> None:
         self.result_label.set_image(QPixmap.fromImage(numpy_to_qimage(result.merged_image)))
-        self._set_status("Overlap computed.", error=False)
+        self._has_result = True
+        if (result.manual_confidence or 0.0) < MANUAL_ALIGN_LOW_CONFIDENCE_THRESHOLD:
+            self._set_status(
+                "Overlap computed - manual alignment confidence is low; inspect the result "
+                "closely, or Re-align.",
+                error=True,
+            )
+        else:
+            self._set_status("Overlap computed.", error=False)
         self.results_label.setText(_format_results(result))
         self._cleanup_worker()
+        self._set_manual_mode(False)
 
     def _on_worker_failed(self, message: str) -> None:
         self._set_status(f"Overlap computation failed: {message}", error=True)
         self._cleanup_worker()
+        self._set_manual_mode(True)
 
     def _on_worker_cancelled(self) -> None:
         self._set_status("Overlap computation stopped.", error=True)
         self._cleanup_worker()
+        self._set_manual_mode(True)
 
     def _cleanup_worker(self) -> None:
         self._thread = None
         self._worker = None
         self._cancel_event = None
         self.stop_button.setEnabled(False)
-        self._update_compute_state()
+        self.clear_button.setEnabled(True)
 
     # ---------- helpers ----------
     def _on_zoom_changed(self, percent: int) -> None:
@@ -325,14 +495,25 @@ def _format_results(result: OverlapResult) -> str:
     ]
     if result.mm is not None:
         lines.append(
-            f"Checkerboard region (image 1): {result.mm.width_mm:.1f} x {result.mm.height_mm:.1f} mm "
-            f"(area {result.mm.area_mm2 / 100.0:.1f} cm2) - physical size only within the "
-            f"detected board's own extent, not the whole overlap"
+            f"Overlap size: {result.mm.width_mm:.1f} x {result.mm.height_mm:.1f} mm "
+            f"(area {result.mm.area_mm2 / 100.0:.1f} cm2) - using the checkerboard's 25x25mm "
+            f"squares as scale reference, most accurate where the scene is roughly flat"
         )
     else:
-        lines.append("Physical size: unavailable (no checkerboard detected in image 1)")
+        lines.append("Physical size: unavailable (no checkerboard detected in either image)")
     lines.append(
         f"Checkerboard corners detected: image 1 = {result.corners_detected_1}, "
-        f"image 2 = {result.corners_detected_2} | alignment inliers = {result.inlier_matches}"
+        f"image 2 = {result.corners_detected_2}"
     )
+    lines.append(_format_alignment_line(result.manual_confidence))
     return "\n".join(lines)
+
+
+def _format_alignment_line(confidence: float | None) -> str:
+    conf_text = f"{confidence:.2f}" if confidence is not None else "unavailable"
+    if confidence is not None and confidence < MANUAL_ALIGN_LOW_CONFIDENCE_THRESHOLD:
+        return (
+            f"Alignment: manual placement refined by local pixel correlation "
+            f"(confidence {conf_text}, low) - inspect the result closely, or re-align"
+        )
+    return f"Alignment: manual placement refined by local pixel correlation (confidence {conf_text})"
