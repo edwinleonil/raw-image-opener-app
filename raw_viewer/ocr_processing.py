@@ -22,18 +22,21 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Everything this needs (detection/recognition/orientation models) is
-# downloaded once to ~/.paddlex/official_models on first use and cached
-# locally after that - disable PaddleX's per-run "phone home" connectivity
-# check and force huggingface_hub to use that local cache only, so normal
-# use never depends on network access.
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["HF_HUB_OFFLINE"] = "1"
 
 _TARGET_MIN_DIM_PX = 600
 _MAX_UPSCALE = 6.0
+_MAX_DIM_PX = 4000
 
 _engine = None
+_MODEL_NAMES = {
+    "doc_orientation_classify": "PP-LCNet_x1_0_doc_ori",
+    "doc_unwarping": "UVDoc",
+    "text_detection": "PP-OCRv5_server_det",
+    "textline_orientation": "PP-LCNet_x1_0_textline_ori",
+    "text_recognition": "en_PP-OCRv5_mobile_rec",
+}
 
 # The pip-distributed paddlepaddle-gpu wheel doesn't bundle cuDNN/cuBLAS/NVRTC
 # on Windows - it expects them on PATH. We depend on the matching NVIDIA pip
@@ -66,25 +69,62 @@ class OcrResult:
 
 
 def preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
-    """Upscale a small crop so the detector/recognizer has enough pixels to work with."""
-    if crop.ndim == 2:
-        crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB)
-
+    """Convert uint8 grayscale/RGB to bounded, contiguous BGR input for PaddleOCR."""
+    if crop.dtype != np.uint8 or not (
+        crop.ndim == 2 or (crop.ndim == 3 and crop.shape[2] == 3)
+    ):
+        raise ValueError("OCR expects an 8-bit grayscale or RGB image")
+    if crop.size == 0:
+        raise ValueError("OCR crop must not be empty")
     height, width = crop.shape[:2]
-    scale = min(max(1.0, _TARGET_MIN_DIM_PX / min(height, width)), _MAX_UPSCALE)
-    if scale <= 1.0:
-        return crop
-    return cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    scale = min(
+        max(1.0, _TARGET_MIN_DIM_PX / min(height, width)),
+        _MAX_UPSCALE,
+        _MAX_DIM_PX / max(height, width),
+    )
+    if scale != 1.0:
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        crop = cv2.resize(
+            crop, size, interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+        )
+    conversion = cv2.COLOR_GRAY2BGR if crop.ndim == 2 else cv2.COLOR_RGB2BGR
+    return cv2.cvtColor(crop, conversion)
+
+
+def _local_model_options() -> dict[str, str]:
+    cache = Path(os.environ.get("PADDLE_PDX_CACHE_HOME", str(Path.home() / ".paddlex")))
+    model_root = cache.expanduser().resolve() / "official_models"
+    options = {}
+    missing = []
+    for component, name in _MODEL_NAMES.items():
+        model_dir = model_root / name
+        required_files = ("inference.json", "inference.pdiparams", "inference.yml")
+        if not all((model_dir / filename).is_file() for filename in required_files):
+            missing.append(name)
+        options[f"{component}_model_name"] = name
+        options[f"{component}_model_dir"] = str(model_dir)
+    if missing:
+        raise RuntimeError(
+            f"OCR is offline; missing or incomplete models in {model_root}: "
+            f"{', '.join(missing)}. Provision the models as described in README.md, then retry."
+        )
+    return options
 
 
 def get_ocr_engine():
     """Lazily construct and cache the OCR engine (slow to load)."""
     global _engine
     if _engine is None:
+        options = _local_model_options()
         _register_cuda_dll_directories()
         from paddleocr import PaddleOCR
 
-        _engine = PaddleOCR(use_textline_orientation=True, lang="en")
+        _engine = PaddleOCR(
+            use_doc_orientation_classify=True,
+            use_doc_unwarping=True,
+            use_textline_orientation=True,
+            **options,
+        )
     return _engine
 
 

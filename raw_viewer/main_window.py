@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
@@ -57,6 +57,7 @@ class _OcrWorker(QObject):
         super().__init__()
         self._crop = crop
 
+    @Slot()
     def run(self) -> None:
         try:
             result = run_ocr(self._crop)
@@ -519,6 +520,7 @@ class MainWindow(QMainWindow):
         self.ocr_confidence_label.setText("Reading text… (first run loads the OCR model)")
         self._ocr_thread.start()
 
+    @Slot(object)
     def _on_ocr_finished(self, result) -> None:
         if not self._ocr_result_valid:
             return
@@ -527,13 +529,16 @@ class MainWindow(QMainWindow):
             "No text found" if not result.text else f"{result.confidence * 100:.0f}% confidence"
         )
 
+    @Slot(str)
     def _on_ocr_failed(self, message: str) -> None:
         if not self._ocr_result_valid:
             return
         self.error_label.setText(f"OCR failed: {message}")
         self.ocr_confidence_label.setText("")
 
+    @Slot()
     def _cleanup_ocr_worker(self) -> None:
+        self._ocr_thread.wait()
         self.ocr_button.setEnabled(True)
         self._ocr_thread = None
         self._ocr_worker = None
