@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings, QTimer
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QPlainTextEdit,
     QPushButton,
     QSlider,
     QTabWidget,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .hdr_tab import HdrBurstTab
+from .ocr_processing import run_ocr
 from .overlap_tab import OverlapTab
 from .trials_tab import TrialsTab
 from .raw_loader import (
@@ -41,6 +43,29 @@ RAW_EXTENSIONS = {".raw"}
 ROTATION_OPTIONS = [("0°", 0), ("90° CW", 90), ("180°", 180), ("90° CCW (-90°)", 270)]
 
 
+class _OcrWorker(QObject):
+    """Runs OCR on a cropped image region on a background thread.
+
+    Keeps the UI thread responsive while PaddleOCR loads its models (a
+    one-time cost, paid on the first OCR run) and recognizes text.
+    """
+
+    finished = Signal(object)  # OcrResult
+    failed = Signal(str)
+
+    def __init__(self, crop):
+        super().__init__()
+        self._crop = crop
+
+    def run(self) -> None:
+        try:
+            result = run_ocr(self._crop)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(result)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -54,6 +79,9 @@ class MainWindow(QMainWindow):
         self.index: int = -1
         self._last_rendered_path: Path | None = None
         self._measurement_count: int = 0
+        self._current_image8 = None
+        self._ocr_thread: QThread | None = None
+        self._ocr_worker: _OcrWorker | None = None
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
@@ -76,6 +104,7 @@ class MainWindow(QMainWindow):
         self.image_label.zoom_changed.connect(self._on_zoom_changed)
         self.image_label.measurement_added.connect(self._on_measurement_added)
         self.image_label.measurements_cleared.connect(self._on_measurements_cleared)
+        self.image_label.ocr_region_selected.connect(self._on_ocr_region_selected)
         left.addWidget(self.image_label, stretch=1)
 
         zoom_bar = QHBoxLayout()
@@ -104,8 +133,13 @@ class MainWindow(QMainWindow):
 
         self.measure_button = QPushButton("Measure")
         self.measure_button.setCheckable(True)
-        self.measure_button.toggled.connect(self.image_label.set_measure_mode)
+        self.measure_button.toggled.connect(self._on_measure_mode_toggled)
         zoom_bar.addWidget(self.measure_button)
+
+        self.ocr_button = QPushButton("OCR")
+        self.ocr_button.setCheckable(True)
+        self.ocr_button.toggled.connect(self._on_ocr_mode_toggled)
+        zoom_bar.addWidget(self.ocr_button)
 
         zoom_bar.addStretch(1)
         left.addLayout(zoom_bar)
@@ -237,6 +271,27 @@ class MainWindow(QMainWindow):
 
         panel.addWidget(measure_box)
 
+        ocr_box = QGroupBox("OCR")
+        ocr_layout = QVBoxLayout(ocr_box)
+
+        self.ocr_result_edit = QPlainTextEdit()
+        self.ocr_result_edit.setReadOnly(True)
+        self.ocr_result_edit.setMaximumHeight(60)
+        self.ocr_result_edit.setPlaceholderText(
+            "Enable OCR mode and drag a box around a stamped/engraved code"
+        )
+        ocr_layout.addWidget(self.ocr_result_edit)
+
+        self.ocr_confidence_label = QLabel("")
+        self.ocr_confidence_label.setStyleSheet("color: #666666;")
+        ocr_layout.addWidget(self.ocr_confidence_label)
+
+        self.ocr_clear_button = QPushButton("Clear")
+        self.ocr_clear_button.clicked.connect(self._on_ocr_clear_clicked)
+        ocr_layout.addWidget(self.ocr_clear_button)
+
+        panel.addWidget(ocr_box)
+
         hint = QLabel(
             "Each .raw file needs a matching <name>.json sidecar (width, "
             "height, dtype, format, plus capture settings) next to it - "
@@ -278,6 +333,9 @@ class MainWindow(QMainWindow):
 
         self.rotation_combo.currentIndexChanged.connect(
             lambda *_: self.image_label.clear_measurements()
+        )
+        self.rotation_combo.currentIndexChanged.connect(
+            lambda *_: self.image_label.clear_ocr_box()
         )
 
     def _connect_shortcuts(self) -> None:
@@ -394,6 +452,64 @@ class MainWindow(QMainWindow):
         for slider in (self.brightness_slider, self.contrast_slider, self.sharpness_slider):
             slider.setValue(0)
 
+    def _on_measure_mode_toggled(self, enabled: bool) -> None:
+        if enabled and self.ocr_button.isChecked():
+            self.ocr_button.setChecked(False)
+        self.image_label.set_measure_mode(enabled)
+
+    def _on_ocr_mode_toggled(self, enabled: bool) -> None:
+        if enabled and self.measure_button.isChecked():
+            self.measure_button.setChecked(False)
+        self.image_label.set_ocr_mode(enabled)
+
+    def _on_ocr_clear_clicked(self) -> None:
+        self.image_label.clear_ocr_box()
+        self.ocr_result_edit.setPlainText("")
+        self.ocr_confidence_label.setText("")
+
+    def _on_ocr_region_selected(self, rect) -> None:
+        if self._current_image8 is None or self._ocr_thread is not None:
+            return
+
+        height, width = self._current_image8.shape[:2]
+        x0, y0 = max(0, rect.x()), max(0, rect.y())
+        x1, y1 = min(width, rect.x() + rect.width()), min(height, rect.y() + rect.height())
+        if x1 <= x0 or y1 <= y0:
+            return
+        crop = self._current_image8[y0:y1, x0:x1]
+
+        self._ocr_worker = _OcrWorker(crop)
+        self._ocr_thread = QThread(self)
+        self._ocr_worker.moveToThread(self._ocr_thread)
+
+        self._ocr_thread.started.connect(self._ocr_worker.run)
+        self._ocr_worker.finished.connect(self._on_ocr_finished)
+        self._ocr_worker.failed.connect(self._on_ocr_failed)
+        self._ocr_worker.finished.connect(self._ocr_thread.quit)
+        self._ocr_worker.failed.connect(self._ocr_thread.quit)
+        self._ocr_thread.finished.connect(self._cleanup_ocr_worker)
+
+        self.ocr_button.setEnabled(False)
+        self.error_label.setText("")
+        self.ocr_result_edit.setPlainText("")
+        self.ocr_confidence_label.setText("Reading text… (first run loads the OCR model)")
+        self._ocr_thread.start()
+
+    def _on_ocr_finished(self, result) -> None:
+        self.ocr_result_edit.setPlainText(result.text)
+        self.ocr_confidence_label.setText(
+            "No text found" if not result.text else f"{result.confidence * 100:.0f}% confidence"
+        )
+
+    def _on_ocr_failed(self, message: str) -> None:
+        self.error_label.setText(f"OCR failed: {message}")
+        self.ocr_confidence_label.setText("")
+
+    def _cleanup_ocr_worker(self) -> None:
+        self.ocr_button.setEnabled(True)
+        self._ocr_thread = None
+        self._ocr_worker = None
+
     def _on_measurement_added(self, measurement) -> None:
         self._measurement_count += 1
         p1, p2, dist = measurement.p1, measurement.p2, measurement.distance_px
@@ -425,6 +541,7 @@ class MainWindow(QMainWindow):
         sidecar = load_sidecar_metadata(path)
         self._update_metadata_panel(sidecar)
         if sidecar is None:
+            self._current_image8 = None
             message = f"{path.name}: no matching {path.with_suffix('.json').name} sidecar found"
             self.image_label.clear_image(message)
             self.error_label.setText(message)
@@ -443,6 +560,7 @@ class MainWindow(QMainWindow):
                 path, width, height, bytes_per_pixel, big_endian, pattern, norm_mode
             )
         except RawFormatError as exc:
+            self._current_image8 = None
             self.image_label.clear_image(str(exc))
             self.error_label.setText(str(exc))
             self.status_label.setText(f"{self.index + 1} / {len(self.files)} — {path.name}")
@@ -461,6 +579,7 @@ class MainWindow(QMainWindow):
         if rotation_degrees:
             image8 = rotate_image(image8, rotation_degrees)
 
+        self._current_image8 = image8
         qimage = numpy_to_qimage(image8)
         self.image_label.set_image(QPixmap.fromImage(qimage), reset_view=is_new_image)
         self.status_label.setText(f"{self.index + 1} / {len(self.files)} — {path.name}")

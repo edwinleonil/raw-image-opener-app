@@ -8,6 +8,8 @@ dependencies = [
     "PySide6>=6.5",
     "numpy>=1.24",
     "opencv-python-headless>=4.8",
+    "paddleocr>=2.7",
+    "paddlepaddle-gpu>=3.0",
 ]
 
 [dependency-groups]
@@ -17,3 +19,11 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-cu129" }
+
+[[tool.uv.index]]
+name = "paddle-cu129"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
+explicit = true

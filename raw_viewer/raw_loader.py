@@ -78,6 +78,7 @@ def load_sidecar_metadata(raw_path: Path) -> dict | None:
         "exposure_us": _num(data.get("exposure_us")),
         "gain_db": _num(data.get("gain_db")),
         "light_current_ma": _num(data.get("light_current_ma")),
+        "light_brightness_pct": _num(data.get("light_brightness_pct")),
         "captured_at": data.get("captured_at"),
     }
 

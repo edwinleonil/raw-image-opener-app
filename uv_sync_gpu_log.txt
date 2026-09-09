@@ -1,0 +1,8 @@
+Resolved 95 packages in 3.40s
+Downloading paddlepaddle-gpu (552.5MiB)
+ Downloading paddlepaddle-gpu
+Prepared 1 package in 1m 18s
+Uninstalled 1 package in 2.65s
+Installed 1 package in 4.81s
+ - paddlepaddle==3.3.1
+ + paddlepaddle-gpu==3.3.1

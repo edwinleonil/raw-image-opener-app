@@ -34,6 +34,7 @@ COLUMN_HEADERS = [
     "Exposure (µs)",
     "Gain (dB)",
     "Light Current (mA)",
+    "Light Brightness (%)",
     "Images",
     "Captured At",
 ]
@@ -47,6 +48,7 @@ class TrialRow:
     exposure_us: float | None
     gain_db: float | None
     light_current_ma: float | None
+    light_brightness_pct: float | None
     captured_at: str | None
 
 
@@ -74,6 +76,7 @@ def scan_trials(parent: Path) -> list[TrialRow]:
                 exposure_us=sidecar["exposure_us"] if sidecar else None,
                 gain_db=sidecar["gain_db"] if sidecar else None,
                 light_current_ma=sidecar["light_current_ma"] if sidecar else None,
+                light_brightness_pct=sidecar["light_brightness_pct"] if sidecar else None,
                 captured_at=sidecar["captured_at"] if sidecar else None,
             )
         )
@@ -82,6 +85,10 @@ def scan_trials(parent: Path) -> list[TrialRow]:
 
 def _cell_text(value) -> str:
     return "—" if value is None else str(value)
+
+
+def _percent_text(value) -> str:
+    return "—" if value is None else f"{value:.1f}%"
 
 
 class _NumericTableWidgetItem(QTableWidgetItem):
@@ -204,6 +211,9 @@ class TrialsTab(QWidget):
                 _NumericTableWidgetItem(_cell_text(row.exposure_us), row.exposure_us),
                 _NumericTableWidgetItem(_cell_text(row.gain_db), row.gain_db),
                 _NumericTableWidgetItem(_cell_text(row.light_current_ma), row.light_current_ma),
+                _NumericTableWidgetItem(
+                    _percent_text(row.light_brightness_pct), row.light_brightness_pct
+                ),
                 _NumericTableWidgetItem(str(row.image_count), row.image_count),
                 QTableWidgetItem(_cell_text(row.captured_at)),
             ]

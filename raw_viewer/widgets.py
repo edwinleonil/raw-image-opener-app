@@ -4,13 +4,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from PySide6.QtCore import QLineF, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QLineF, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsLineItem,
     QGraphicsPixmapItem,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
@@ -64,13 +65,16 @@ class ZoomableImageView(QGraphicsView):
     zoom_changed = Signal(int)  # current zoom, as a percentage
     measurement_added = Signal(object)  # emits a Measurement when a pair completes
     measurements_cleared = Signal()
+    ocr_region_selected = Signal(QRect)  # image-pixel rect of a drawn OCR box
 
     MIN_ZOOM = 0.05
     MAX_ZOOM = 32.0
     ZOOM_STEP = 1.15
+    MIN_OCR_BOX_SIZE_PX = 4
 
     PENDING_MARKER_COLOR = QColor("#ffb300")
     MEASUREMENT_COLOR = QColor("#00e5ff")
+    OCR_BOX_COLOR = QColor("#ff4081")
 
     def __init__(self):
         super().__init__()
@@ -87,6 +91,11 @@ class ZoomableImageView(QGraphicsView):
         self._measurements: list[_MeasurementOverlay] = []
         self._saved_drag_mode = QGraphicsView.ScrollHandDrag
 
+        self._ocr_mode = False
+        self._ocr_drag_start: QPointF | None = None
+        self._ocr_drag_rect_item: QGraphicsRectItem | None = None
+        self._ocr_box_item: QGraphicsRectItem | None = None
+
         self.setRenderHint(QPainter.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
@@ -99,6 +108,7 @@ class ZoomableImageView(QGraphicsView):
     def set_image(self, pixmap: QPixmap, reset_view: bool = True) -> None:
         if reset_view:
             self.clear_measurements()
+            self.clear_ocr_box()
         self._pixmap_item.setPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
         self._has_image = True
@@ -110,6 +120,7 @@ class ZoomableImageView(QGraphicsView):
 
     def clear_image(self, text: str = "") -> None:
         self.clear_measurements()
+        self.clear_ocr_box()
         self._pixmap_item.setPixmap(QPixmap())
         self._scene.setSceneRect(QRectF())
         self._has_image = False
@@ -186,7 +197,26 @@ class ZoomableImageView(QGraphicsView):
         if self._measure_mode and self._has_image and event.button() == Qt.LeftButton:
             self._handle_measure_click(event)
             return
+        if self._ocr_mode and self._has_image and event.button() == Qt.LeftButton:
+            self._start_ocr_drag(event)
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._ocr_mode and self._ocr_drag_start is not None:
+            self._update_ocr_drag(event)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if (
+            self._ocr_mode
+            and self._ocr_drag_start is not None
+            and event.button() == Qt.LeftButton
+        ):
+            self._finish_ocr_drag(event)
+            return
+        super().mouseReleaseEvent(event)
 
     def _handle_measure_click(self, event) -> None:
         scene_pos = self.mapToScene(event.position().toPoint())
@@ -248,6 +278,73 @@ class ZoomableImageView(QGraphicsView):
         return _MeasurementOverlay(
             line_item, marker_a, marker_b, text_item, Measurement(p1, p2, distance)
         )
+
+    # ---------- OCR box selection ----------
+    def set_ocr_mode(self, enabled: bool) -> None:
+        if enabled == self._ocr_mode:
+            return
+        self._ocr_mode = enabled
+        if enabled:
+            self._saved_drag_mode = self.dragMode()
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setDragMode(self._saved_drag_mode)
+            self.unsetCursor()
+            self._cancel_ocr_drag()
+
+    def clear_ocr_box(self) -> None:
+        self._cancel_ocr_drag()
+        if self._ocr_box_item is not None:
+            self._scene.removeItem(self._ocr_box_item)
+        self._ocr_box_item = None
+
+    def _cancel_ocr_drag(self) -> None:
+        if self._ocr_drag_rect_item is not None:
+            self._scene.removeItem(self._ocr_drag_rect_item)
+        self._ocr_drag_rect_item = None
+        self._ocr_drag_start = None
+
+    def _ocr_box_pen(self) -> QPen:
+        pen = QPen(self.OCR_BOX_COLOR, 2)
+        pen.setCosmetic(True)
+        return pen
+
+    def _start_ocr_drag(self, event) -> None:
+        scene_pos = self.mapToScene(event.position().toPoint())
+        self._ocr_drag_start = scene_pos
+        rect_item = QGraphicsRectItem(QRectF(scene_pos, scene_pos))
+        rect_item.setPen(self._ocr_box_pen())
+        rect_item.setZValue(10)
+        self._scene.addItem(rect_item)
+        self._ocr_drag_rect_item = rect_item
+
+    def _update_ocr_drag(self, event) -> None:
+        scene_pos = self.mapToScene(event.position().toPoint())
+        self._ocr_drag_rect_item.setRect(QRectF(self._ocr_drag_start, scene_pos).normalized())
+
+    def _finish_ocr_drag(self, event) -> None:
+        scene_pos = self.mapToScene(event.position().toPoint())
+        drag_rect = QRectF(self._ocr_drag_start, scene_pos).normalized()
+        self._cancel_ocr_drag()
+
+        pixmap_rect = QRectF(self._pixmap_item.pixmap().rect())
+        clamped = drag_rect.intersected(pixmap_rect)
+        if clamped.width() < self.MIN_OCR_BOX_SIZE_PX or clamped.height() < self.MIN_OCR_BOX_SIZE_PX:
+            return
+
+        if self._ocr_box_item is not None:
+            self._scene.removeItem(self._ocr_box_item)
+        box_item = QGraphicsRectItem(clamped)
+        box_item.setPen(self._ocr_box_pen())
+        box_item.setZValue(10)
+        self._scene.addItem(box_item)
+        self._ocr_box_item = box_item
+
+        image_rect = QRect(
+            round(clamped.x()), round(clamped.y()), round(clamped.width()), round(clamped.height())
+        )
+        self.ocr_region_selected.emit(image_rect)
 
     # ---------- placeholder ----------
     def paintEvent(self, event) -> None:
