@@ -10,7 +10,11 @@ images.
 """
 from __future__ import annotations
 
+import importlib
+import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -18,6 +22,29 @@ import numpy as np
 _MIN_CROP_HEIGHT_PX = 48
 
 _engine = None
+
+# The pip-distributed paddlepaddle-gpu wheel doesn't bundle cuDNN/cuBLAS/NVRTC
+# on Windows - it expects them on PATH. We depend on the matching NVIDIA pip
+# wheels instead (nvidia-cudnn-cu12 etc, see pyproject.toml) so no manual
+# driver-site download is needed, but Windows still won't find their DLLs
+# unless we register each wheel's bin/ directory before paddle loads them.
+_CUDA_DLL_PACKAGES = ("nvidia.cublas", "nvidia.cuda_nvrtc", "nvidia.cudnn")
+
+
+def _register_cuda_dll_directories() -> None:
+    if sys.platform != "win32":
+        return
+    for package_name in _CUDA_DLL_PACKAGES:
+        try:
+            module = importlib.import_module(package_name)
+        except ImportError:
+            continue
+        # These are PEP 420 namespace packages (no __init__.py), so they have
+        # no __file__ - locate them via __path__ instead.
+        for search_path in module.__path__:
+            bin_dir = Path(search_path) / "bin"
+            if bin_dir.is_dir():
+                os.add_dll_directory(str(bin_dir))
 
 
 @dataclass(frozen=True)
@@ -44,6 +71,7 @@ def get_ocr_engine():
     """Lazily construct and cache the OCR engine (slow to load)."""
     global _engine
     if _engine is None:
+        _register_cuda_dll_directories()
         from paddleocr import TextRecognition
 
         _engine = TextRecognition()
