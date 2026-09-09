@@ -82,6 +82,8 @@ class MainWindow(QMainWindow):
         self._current_image8 = None
         self._ocr_thread: QThread | None = None
         self._ocr_worker: _OcrWorker | None = None
+        self._ocr_result_valid = False
+        self._close_pending = False
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
@@ -370,6 +372,12 @@ class MainWindow(QMainWindow):
             s.setValue("trials_parent_folder", str(trials_parent_folder))
 
     def closeEvent(self, event) -> None:
+        if self._ocr_thread is not None:
+            self._close_pending = True
+            self._on_ocr_clear_clicked()
+            self.ocr_confidence_label.setText("Waiting for OCR to finish before closing...")
+            event.ignore()
+            return
         self._save_settings()
         super().closeEvent(event)
 
@@ -416,6 +424,9 @@ class MainWindow(QMainWindow):
         self.overlap_tab.set_available_files(files)
         self._save_settings()
         if not files:
+            self._current_image8 = None
+            self._last_rendered_path = None
+            self._on_ocr_clear_clicked()
             self.image_label.clear_image(f"No .raw files found in:\n{folder}")
             self.status_label.setText("No .raw files found")
             self._update_nav_state()
@@ -443,6 +454,7 @@ class MainWindow(QMainWindow):
 
     # ---------- format controls ----------
     def _on_format_changed(self) -> None:
+        self._on_ocr_clear_clicked()
         self._refresh_timer.start()
 
     def _on_zoom_changed(self, percent: int) -> None:
@@ -460,15 +472,23 @@ class MainWindow(QMainWindow):
     def _on_ocr_mode_toggled(self, enabled: bool) -> None:
         if enabled and self.measure_button.isChecked():
             self.measure_button.setChecked(False)
-        self.image_label.set_ocr_mode(enabled)
+        self.image_label.set_ocr_mode(enabled and self._ocr_thread is None)
 
     def _on_ocr_clear_clicked(self) -> None:
+        self._ocr_result_valid = False
         self.image_label.clear_ocr_box()
         self.ocr_result_edit.setPlainText("")
         self.ocr_confidence_label.setText("")
+        if self.error_label.text().startswith("OCR failed:"):
+            self.error_label.setText("")
 
     def _on_ocr_region_selected(self, rect) -> None:
-        if self._current_image8 is None or self._ocr_thread is not None:
+        if (
+            self._current_image8 is None
+            or self._ocr_thread is not None
+            or self._close_pending
+            or self._refresh_timer.isActive()
+        ):
             return
 
         height, width = self._current_image8.shape[:2]
@@ -476,8 +496,9 @@ class MainWindow(QMainWindow):
         x1, y1 = min(width, rect.x() + rect.width()), min(height, rect.y() + rect.height())
         if x1 <= x0 or y1 <= y0:
             return
-        crop = self._current_image8[y0:y1, x0:x1]
+        crop = self._current_image8[y0:y1, x0:x1].copy()
 
+        self._ocr_result_valid = True
         self._ocr_worker = _OcrWorker(crop)
         self._ocr_thread = QThread(self)
         self._ocr_worker.moveToThread(self._ocr_thread)
@@ -487,21 +508,28 @@ class MainWindow(QMainWindow):
         self._ocr_worker.failed.connect(self._on_ocr_failed)
         self._ocr_worker.finished.connect(self._ocr_thread.quit)
         self._ocr_worker.failed.connect(self._ocr_thread.quit)
+        self._ocr_thread.finished.connect(self._ocr_worker.deleteLater)
         self._ocr_thread.finished.connect(self._cleanup_ocr_worker)
+        self._ocr_thread.finished.connect(self._ocr_thread.deleteLater)
 
         self.ocr_button.setEnabled(False)
+        self.image_label.set_ocr_mode(False)
         self.error_label.setText("")
         self.ocr_result_edit.setPlainText("")
         self.ocr_confidence_label.setText("Reading text… (first run loads the OCR model)")
         self._ocr_thread.start()
 
     def _on_ocr_finished(self, result) -> None:
+        if not self._ocr_result_valid:
+            return
         self.ocr_result_edit.setPlainText(result.text)
         self.ocr_confidence_label.setText(
             "No text found" if not result.text else f"{result.confidence * 100:.0f}% confidence"
         )
 
     def _on_ocr_failed(self, message: str) -> None:
+        if not self._ocr_result_valid:
+            return
         self.error_label.setText(f"OCR failed: {message}")
         self.ocr_confidence_label.setText("")
 
@@ -509,6 +537,10 @@ class MainWindow(QMainWindow):
         self.ocr_button.setEnabled(True)
         self._ocr_thread = None
         self._ocr_worker = None
+        if self._close_pending:
+            self.close()
+        else:
+            self.image_label.set_ocr_mode(self.ocr_button.isChecked())
 
     def _on_measurement_added(self, measurement) -> None:
         self._measurement_count += 1
@@ -532,6 +564,8 @@ class MainWindow(QMainWindow):
 
     # ---------- rendering ----------
     def _render_current(self) -> None:
+        self._on_ocr_clear_clicked()
+        self._current_image8 = None
         if self.index < 0 or self.index >= len(self.files):
             return
         path = self.files[self.index]

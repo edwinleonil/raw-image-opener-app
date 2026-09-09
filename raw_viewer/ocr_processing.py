@@ -1,12 +1,15 @@
 """OCR for stamped/engraved (DPM-style) alphanumeric codes.
 
-Uses PaddleOCR's standalone `TextRecognition` model (recognition-only,
-no text detection): the caller has already drawn a tight bounding box
-around the code, so there is nothing to detect - the whole crop is one
-line to recognize. Preprocessing enhances contrast and scale, and converts
-back to 3 channels since the recognizer requires an (H, W, 3) input, but
-does not binarize, since the recognizer is trained on natural-contrast
-images.
+Uses PaddleOCR's full pipeline (text detection + text-line orientation +
+recognition), not a recognition-only shortcut: real dot-peen/stamped marks
+are often multiple lines at an arbitrary angle within one selected box (the
+part can be photographed at any rotation), and only the full pipeline
+finds and deskews each line on its own - a recognition-only model expects
+one already-horizontal line and fails outright on multi-line, rotated
+input. Preprocessing just upscales small crops (recognition accuracy on
+tiny crops was the main limiting factor in testing); it does not binarize
+or enhance contrast, since that testing found plain upscaling more
+reliable than adding CLAHE contrast enhancement.
 """
 from __future__ import annotations
 
@@ -19,7 +22,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-_MIN_CROP_HEIGHT_PX = 48
+# Everything this needs (detection/recognition/orientation models) is
+# downloaded once to ~/.paddlex/official_models on first use and cached
+# locally after that - disable PaddleX's per-run "phone home" connectivity
+# check and force huggingface_hub to use that local cache only, so normal
+# use never depends on network access.
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+_TARGET_MIN_DIM_PX = 600
+_MAX_UPSCALE = 6.0
 
 _engine = None
 
@@ -54,17 +66,15 @@ class OcrResult:
 
 
 def preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
-    """Upscale + contrast-enhance a crop for OCR recognition."""
-    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+    """Upscale a small crop so the detector/recognizer has enough pixels to work with."""
+    if crop.ndim == 2:
+        crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB)
 
-    height = gray.shape[0]
-    if 0 < height < _MIN_CROP_HEIGHT_PX:
-        scale = _MIN_CROP_HEIGHT_PX / height
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+    height, width = crop.shape[:2]
+    scale = min(max(1.0, _TARGET_MIN_DIM_PX / min(height, width)), _MAX_UPSCALE)
+    if scale <= 1.0:
+        return crop
+    return cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
 
 def get_ocr_engine():
@@ -72,14 +82,19 @@ def get_ocr_engine():
     global _engine
     if _engine is None:
         _register_cuda_dll_directories()
-        from paddleocr import TextRecognition
+        from paddleocr import PaddleOCR
 
-        _engine = TextRecognition()
+        _engine = PaddleOCR(use_textline_orientation=True, lang="en")
     return _engine
 
 
 def run_ocr(crop: np.ndarray) -> OcrResult:
-    """Recognize text in a pre-selected crop. Returns "" text if none found."""
+    """Recognize text in a selected region. Returns "" text if none found.
+
+    The region may contain more than one line (e.g. a multi-line stamped
+    code) - all detected lines are joined with newlines in reading order,
+    and the confidence is the average across them.
+    """
     if crop.size == 0:
         return OcrResult("", 0.0)
 
@@ -89,5 +104,13 @@ def run_ocr(crop: np.ndarray) -> OcrResult:
     if not results:
         return OcrResult("", 0.0)
 
-    result = results[0]
-    return OcrResult(result["rec_text"], result["rec_score"])
+    texts: list[str] = []
+    scores: list[float] = []
+    for result in results:
+        texts.extend(result["rec_texts"])
+        scores.extend(result["rec_scores"])
+
+    if not texts:
+        return OcrResult("", 0.0)
+
+    return OcrResult("\n".join(texts), sum(scores) / len(scores))
