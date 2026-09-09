@@ -2219,7 +2219,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'win32'", specifier = ">=9.0" },
     { name = "opencv-python-headless", specifier = ">=4.8" },
-    { name = "paddleocr", specifier = ">=2.7" },
+    { name = "paddleocr", specifier = ">=3.4.1,<4" },
     { name = "paddlepaddle-gpu", specifier = ">=3.0", index = "https://www.paddlepaddle.org.cn/packages/stable/cu126/" },
     { name = "pyside6", specifier = ">=6.5" },
 ]
