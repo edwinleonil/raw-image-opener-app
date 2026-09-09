@@ -6,7 +6,6 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -18,7 +17,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSlider,
-    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -26,9 +24,8 @@ from PySide6.QtWidgets import (
 
 from .hdr_tab import HdrBurstTab
 from .overlap_tab import OverlapTab
+from .trials_tab import TrialsTab
 from .raw_loader import (
-    BAYER_PATTERNS,
-    NORMALIZATION_MODES,
     RawFormatError,
     adjust_brightness_contrast,
     load_sidecar_metadata,
@@ -149,51 +146,24 @@ class MainWindow(QMainWindow):
         file_path_row.addWidget(browse_file_button)
         panel.addLayout(file_path_row)
 
-        format_box = QGroupBox("Raw format")
-        form = QFormLayout(format_box)
+        metadata_box = QGroupBox("Capture metadata")
+        metadata_form = QFormLayout(metadata_box)
 
-        self.width_spin = QSpinBox()
-        self.width_spin.setRange(1, 20000)
-        self.width_spin.setValue(5328)
-        form.addRow("Width", self.width_spin)
+        self.sidecar_label = QLabel("")
+        self.sidecar_label.setWordWrap(True)
+        self.sidecar_label.setStyleSheet("color: #666666;")
+        metadata_form.addRow(self.sidecar_label)
 
-        self.auto_height_check = QCheckBox("Auto (from file size)")
-        self.auto_height_check.setChecked(True)
-        form.addRow("", self.auto_height_check)
+        self.exposure_value_label = QLabel("—")
+        metadata_form.addRow("exposure_us", self.exposure_value_label)
 
-        self.height_spin = QSpinBox()
-        self.height_spin.setRange(1, 20000)
-        self.height_spin.setValue(4608)
-        self.height_spin.setEnabled(False)
-        form.addRow("Height", self.height_spin)
+        self.gain_value_label = QLabel("—")
+        metadata_form.addRow("gain_db", self.gain_value_label)
 
-        self.bpp_combo = QComboBox()
-        self.bpp_combo.addItems(["1 byte (8-bit)", "2 bytes (16-bit)"])
-        form.addRow("Bytes / pixel", self.bpp_combo)
+        self.light_current_value_label = QLabel("—")
+        metadata_form.addRow("light_current_ma", self.light_current_value_label)
 
-        self.endian_combo = QComboBox()
-        self.endian_combo.addItems(["Little-endian", "Big-endian"])
-        form.addRow("Byte order", self.endian_combo)
-
-        self.pattern_combo = QComboBox()
-        self.pattern_combo.addItems(BAYER_PATTERNS)
-        self.pattern_combo.setCurrentIndex(BAYER_PATTERNS.index("RGGB"))
-        form.addRow("Bayer pattern", self.pattern_combo)
-
-        self.norm_combo = QComboBox()
-        self.norm_combo.addItems(NORMALIZATION_MODES)
-        form.addRow("Display levels", self.norm_combo)
-
-        self._format_controls = [
-            self.width_spin,
-            self.auto_height_check,
-            self.height_spin,
-            self.bpp_combo,
-            self.endian_combo,
-            self.pattern_combo,
-        ]
-
-        panel.addWidget(format_box)
+        panel.addWidget(metadata_box)
 
         rotation_box = QGroupBox("Rotation")
         rotation_form = QFormLayout(rotation_box)
@@ -267,17 +237,11 @@ class MainWindow(QMainWindow):
 
         panel.addWidget(measure_box)
 
-        self.sidecar_label = QLabel("")
-        self.sidecar_label.setWordWrap(True)
-        self.sidecar_label.setStyleSheet("color: #2e7d32;")
-        panel.addWidget(self.sidecar_label)
-
         hint = QLabel(
-            "These .raw files have no header, so width/height/bit depth "
-            "can't be detected automatically. Adjust the fields above until "
-            "the preview looks correct - a wrong width shows up as diagonal "
-            "tearing. If a matching <name>.json sidecar sits next to a .raw "
-            "file, its format is used automatically instead."
+            "Each .raw file needs a matching <name>.json sidecar (width, "
+            "height, dtype, format, plus capture settings) next to it - "
+            "files without one can't be opened. The panel above shows the "
+            "capture settings from that sidecar."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #666666;")
@@ -292,20 +256,19 @@ class MainWindow(QMainWindow):
 
         root.addLayout(panel, stretch=1)
 
-        tabs = QTabWidget()
-        tabs.addTab(central, "Viewer")
-        tabs.addTab(HdrBurstTab(), "HDR / Burst Stacking")
+        self.viewer_widget = central
+        self.trials_tab = TrialsTab()
+        self.trials_tab.folder_selected.connect(self._on_trial_folder_selected)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.trials_tab, "Load Data")
+        self.tabs.addTab(central, "Viewer")
+        self.tabs.addTab(HdrBurstTab(), "HDR / Burst Stacking")
         self.overlap_tab = OverlapTab()
-        tabs.addTab(self.overlap_tab, "Overlap Measurement")
-        self.setCentralWidget(tabs)
+        self.tabs.addTab(self.overlap_tab, "Overlap Measurement")
+        self.setCentralWidget(self.tabs)
 
         for signal in (
-            self.width_spin.valueChanged,
-            self.height_spin.valueChanged,
-            self.bpp_combo.currentIndexChanged,
-            self.endian_combo.currentIndexChanged,
-            self.pattern_combo.currentIndexChanged,
-            self.norm_combo.currentIndexChanged,
             self.rotation_combo.currentIndexChanged,
             self.brightness_slider.valueChanged,
             self.contrast_slider.valueChanged,
@@ -313,15 +276,9 @@ class MainWindow(QMainWindow):
         ):
             signal.connect(self._on_format_changed)
 
-        for signal in (
-            self.width_spin.valueChanged,
-            self.height_spin.valueChanged,
-            self.auto_height_check.toggled,
-            self.rotation_combo.currentIndexChanged,
-        ):
-            signal.connect(lambda *_: self.image_label.clear_measurements())
-
-        self.auto_height_check.toggled.connect(self._on_auto_height_toggled)
+        self.rotation_combo.currentIndexChanged.connect(
+            lambda *_: self.image_label.clear_measurements()
+        )
 
     def _connect_shortcuts(self) -> None:
         QShortcut(QKeySequence(Qt.Key_Right), self, activated=self.show_next)
@@ -330,15 +287,6 @@ class MainWindow(QMainWindow):
     # ---------- settings persistence ----------
     def _load_settings(self) -> None:
         s = self.settings
-        self.width_spin.setValue(int(s.value("width", 5328)))
-        self.height_spin.setValue(int(s.value("height", 4608)))
-        self.auto_height_check.setChecked(str(s.value("auto_height", "true")) == "true")
-        self.bpp_combo.setCurrentIndex(int(s.value("bpp_index", 0)))
-        self.endian_combo.setCurrentIndex(int(s.value("endian_index", 0)))
-        self.pattern_combo.setCurrentIndex(
-            int(s.value("pattern_index", BAYER_PATTERNS.index("RGGB")))
-        )
-        self.norm_combo.setCurrentIndex(int(s.value("norm_index", 0)))
         self.rotation_combo.setCurrentIndex(int(s.value("rotation_index", 0)))
         self.brightness_slider.setValue(int(s.value("brightness", 0)))
         self.contrast_slider.setValue(int(s.value("contrast", 0)))
@@ -347,21 +295,21 @@ class MainWindow(QMainWindow):
         if last_folder and Path(last_folder).is_dir():
             self._set_folder(Path(last_folder))
 
+        trials_parent_folder = s.value("trials_parent_folder", "")
+        if trials_parent_folder and Path(trials_parent_folder).is_dir():
+            self.trials_tab.set_parent_folder(Path(trials_parent_folder))
+
     def _save_settings(self) -> None:
         s = self.settings
-        s.setValue("width", self.width_spin.value())
-        s.setValue("height", self.height_spin.value())
-        s.setValue("auto_height", "true" if self.auto_height_check.isChecked() else "false")
-        s.setValue("bpp_index", self.bpp_combo.currentIndex())
-        s.setValue("endian_index", self.endian_combo.currentIndex())
-        s.setValue("pattern_index", self.pattern_combo.currentIndex())
-        s.setValue("norm_index", self.norm_combo.currentIndex())
         s.setValue("rotation_index", self.rotation_combo.currentIndex())
         s.setValue("brightness", self.brightness_slider.value())
         s.setValue("contrast", self.contrast_slider.value())
         s.setValue("sharpness", self.sharpness_slider.value())
         if self.folder:
             s.setValue("last_folder", str(self.folder))
+        trials_parent_folder = self.trials_tab.current_parent_folder()
+        if trials_parent_folder:
+            s.setValue("trials_parent_folder", str(trials_parent_folder))
 
     def closeEvent(self, event) -> None:
         self._save_settings()
@@ -416,6 +364,10 @@ class MainWindow(QMainWindow):
             return
         self._render_current()
 
+    def _on_trial_folder_selected(self, folder: Path) -> None:
+        self._set_folder(folder)
+        self.tabs.setCurrentWidget(self.viewer_widget)
+
     def show_next(self) -> None:
         if self.index + 1 < len(self.files):
             self.index += 1
@@ -432,10 +384,6 @@ class MainWindow(QMainWindow):
         self.next_button.setEnabled(has_files and self.index + 1 < len(self.files))
 
     # ---------- format controls ----------
-    def _on_auto_height_toggled(self, checked: bool) -> None:
-        self.height_spin.setEnabled(not checked)
-        self._on_format_changed()
-
     def _on_format_changed(self) -> None:
         self._refresh_timer.start()
 
@@ -459,15 +407,6 @@ class MainWindow(QMainWindow):
         self.measurements_list.clear()
         self._measurement_count = 0
 
-    def _current_format(self):
-        bytes_per_pixel = 1 if self.bpp_combo.currentIndex() == 0 else 2
-        big_endian = self.endian_combo.currentIndex() == 1
-        pattern = self.pattern_combo.currentText()
-        norm_mode = self.norm_combo.currentText()
-        width = self.width_spin.value()
-        height = None if self.auto_height_check.isChecked() else self.height_spin.value()
-        return width, height, bytes_per_pixel, big_endian, pattern, norm_mode
-
     def _current_adjustments(self) -> tuple[int, int, int]:
         return (
             self.brightness_slider.value(),
@@ -482,20 +421,25 @@ class MainWindow(QMainWindow):
         path = self.files[self.index]
         is_new_image = path != self._last_rendered_path
         self._last_rendered_path = path
-        norm_mode = self.norm_combo.currentText()
 
         sidecar = load_sidecar_metadata(path)
-        self._apply_sidecar_to_controls(sidecar)
-        if sidecar is not None:
-            width, height = sidecar["width"], sidecar["height"]
-            bytes_per_pixel = sidecar["bytes_per_pixel"]
-            big_endian = sidecar["big_endian"]
-            pattern = sidecar["pattern"]
-        else:
-            width, height, bytes_per_pixel, big_endian, pattern, _ = self._current_format()
+        self._update_metadata_panel(sidecar)
+        if sidecar is None:
+            message = f"{path.name}: no matching {path.with_suffix('.json').name} sidecar found"
+            self.image_label.clear_image(message)
+            self.error_label.setText(message)
+            self.status_label.setText(f"{self.index + 1} / {len(self.files)} — {path.name}")
+            self._update_nav_state()
+            return
+
+        width, height = sidecar["width"], sidecar["height"]
+        bytes_per_pixel = sidecar["bytes_per_pixel"]
+        big_endian = sidecar["big_endian"]
+        pattern = sidecar["pattern"]
+        norm_mode = "Auto (min/max)"
 
         try:
-            image8, resolved_height = process_raw_file(
+            image8, _ = process_raw_file(
                 path, width, height, bytes_per_pixel, big_endian, pattern, norm_mode
             )
         except RawFormatError as exc:
@@ -506,10 +450,6 @@ class MainWindow(QMainWindow):
             return
 
         self.error_label.setText("")
-        if sidecar is None and self.auto_height_check.isChecked():
-            self.height_spin.blockSignals(True)
-            self.height_spin.setValue(resolved_height)
-            self.height_spin.blockSignals(False)
 
         brightness, contrast, sharpness = self._current_adjustments()
         if brightness or contrast:
@@ -526,40 +466,24 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"{self.index + 1} / {len(self.files)} — {path.name}")
         self._update_nav_state()
 
-    def _apply_sidecar_to_controls(self, sidecar: dict | None) -> None:
-        for widget in self._format_controls:
-            widget.setEnabled(sidecar is None)
+    def _update_metadata_panel(self, sidecar: dict | None) -> None:
         if sidecar is None:
             self.sidecar_label.setText("")
-            self.auto_height_check.setEnabled(True)
-            self.height_spin.setEnabled(not self.auto_height_check.isChecked())
+            for label in (
+                self.exposure_value_label,
+                self.gain_value_label,
+                self.light_current_value_label,
+            ):
+                label.setText("—")
             return
 
-        self.sidecar_label.setText(
-            f"Using detected format from {sidecar['source']}: "
-            f"{sidecar['width']}x{sidecar['height']}, {sidecar['pattern']}, "
-            f"{sidecar['bytes_per_pixel'] * 8}-bit"
+        self.sidecar_label.setText(f"From {sidecar['source']}")
+        self.exposure_value_label.setText(
+            "—" if sidecar["exposure_us"] is None else str(sidecar["exposure_us"])
         )
-        for widget, value in (
-            (self.width_spin, sidecar["width"]),
-            (self.height_spin, sidecar["height"]),
-        ):
-            widget.blockSignals(True)
-            widget.setValue(value)
-            widget.blockSignals(False)
-
-        self.bpp_combo.blockSignals(True)
-        self.bpp_combo.setCurrentIndex(0 if sidecar["bytes_per_pixel"] == 1 else 1)
-        self.bpp_combo.blockSignals(False)
-
-        self.endian_combo.blockSignals(True)
-        self.endian_combo.setCurrentIndex(1 if sidecar["big_endian"] else 0)
-        self.endian_combo.blockSignals(False)
-
-        self.pattern_combo.blockSignals(True)
-        self.pattern_combo.setCurrentIndex(BAYER_PATTERNS.index(sidecar["pattern"]))
-        self.pattern_combo.blockSignals(False)
-
-        self.auto_height_check.blockSignals(True)
-        self.auto_height_check.setChecked(False)
-        self.auto_height_check.blockSignals(False)
+        self.gain_value_label.setText(
+            "—" if sidecar["gain_db"] is None else str(sidecar["gain_db"])
+        )
+        self.light_current_value_label.setText(
+            "—" if sidecar["light_current_ma"] is None else str(sidecar["light_current_ma"])
+        )

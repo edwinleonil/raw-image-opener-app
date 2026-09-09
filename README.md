@@ -4,15 +4,16 @@ A small desktop viewer for headerless `.raw` sensor dumps (e.g. from a
 machine-vision camera). Pick a folder, and step through the images with
 Next / Previous (or the arrow keys).
 
-These `.raw` files have no header, so the app can't detect width, height,
-bit depth, or Bayer pattern on its own — you set them in the "Raw format"
-panel and the preview updates live. A wrong width typically shows up as
-diagonal tearing; nudge it until the image lines up, then leave "Auto
-(from file size)" checked and the height will be computed for you. Your
-settings are remembered between runs.
+These `.raw` files have no header, so each one needs a matching
+`<name>.json` sidecar next to it describing its width, height, pixel
+format, and Bayer pattern — files without one can't be opened. The
+"Capture metadata" panel shows the sidecar's capture settings
+(`exposure_us`, `gain_db`, `light_current_ma`) for the currently displayed
+image.
 
-Supports 8-bit and 16-bit (little/big-endian) source data, and optional
-Bayer demosaicing (RGGB / BGGR / GRBG / GBRG) to a full-color image.
+Supports 8-bit and 16-bit source data, and optional Bayer demosaicing
+(RGGB / BGGR / GRBG / GBRG) to a full-color image, all driven by the
+sidecar.
 
 ## Run from source
 

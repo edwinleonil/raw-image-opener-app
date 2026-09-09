@@ -65,6 +65,9 @@ def load_sidecar_metadata(raw_path: Path) -> dict | None:
         code = fmt[len("bayer") : len("bayer") + 2]
         pattern = _SIDECAR_BAYER_CODES.get(code, "None (Mono)")
 
+    def _num(value):
+        return value if isinstance(value, (int, float)) else None
+
     return {
         "width": width,
         "height": height,
@@ -72,6 +75,10 @@ def load_sidecar_metadata(raw_path: Path) -> dict | None:
         "big_endian": False,
         "pattern": pattern,
         "source": json_path.name,
+        "exposure_us": _num(data.get("exposure_us")),
+        "gain_db": _num(data.get("gain_db")),
+        "light_current_ma": _num(data.get("light_current_ma")),
+        "captured_at": data.get("captured_at"),
     }
 
 
