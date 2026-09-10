@@ -11,6 +11,18 @@ format, and Bayer pattern — files without one can't be opened. The
 (`exposure_us`, `gain_db`, `light_current_ma`) for the currently displayed
 image.
 
+That panel also shows the working distance and the aperture, which the rig
+records only in the name of the capture folder — `wd600f4_Capture_…` means
+600 mm working distance at f/4. They are read from whichever ancestor folder
+of the image matches that pattern, so they show up whether you open the
+capture folder itself or its `FullSize_RAW_Images` subfolder, and they stay
+visible even if an image's sidecar is missing. Folders named some other way
+just show `—`.
+
+The Load Data tab lists the same two values as sortable `WD (mm)` and
+`f-number` columns, so you can order a whole sweep of trials by working
+distance or aperture before opening one.
+
 Supports 8-bit and 16-bit source data, and optional Bayer demosaicing
 (RGGB / BGGR / GRBG / GBRG) to a full-color image, all driven by the
 sidecar.

@@ -26,11 +26,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .capture_folder import format_number, parse_capture_folder_name
 from .raw_loader import load_sidecar_metadata
 
 RAW_IMAGES_SUBDIR = "FullSize_RAW_Images"
 COLUMN_HEADERS = [
     "Subfolder",
+    "WD (mm)",
+    "f-number",
     "Exposure (µs)",
     "Gain (dB)",
     "Light Current (mA)",
@@ -45,6 +48,8 @@ class TrialRow:
     name: str
     raw_dir: Path
     image_count: int
+    working_distance_mm: float | None
+    f_number: float | None
     exposure_us: float | None
     gain_db: float | None
     light_current_ma: float | None
@@ -68,11 +73,16 @@ def scan_trials(parent: Path) -> list[TrialRow]:
         if not raw_files:
             continue
         sidecar = load_sidecar_metadata(raw_files[0])
+        # The working distance and aperture live in the subfolder's own name
+        # (wd600f4_Capture_...), not in the sidecar - see capture_folder.py.
+        capture = parse_capture_folder_name(sub.name)
         rows.append(
             TrialRow(
                 name=sub.name,
                 raw_dir=raw_dir,
                 image_count=len(raw_files),
+                working_distance_mm=capture.working_distance_mm if capture else None,
+                f_number=capture.f_number if capture else None,
                 exposure_us=sidecar["exposure_us"] if sidecar else None,
                 gain_db=sidecar["gain_db"] if sidecar else None,
                 light_current_ma=sidecar["light_current_ma"] if sidecar else None,
@@ -208,6 +218,10 @@ class TrialsTab(QWidget):
         for row_index, row in enumerate(rows):
             items = [
                 QTableWidgetItem(row.name),
+                _NumericTableWidgetItem(
+                    format_number(row.working_distance_mm), row.working_distance_mm
+                ),
+                _NumericTableWidgetItem(format_number(row.f_number), row.f_number),
                 _NumericTableWidgetItem(_cell_text(row.exposure_us), row.exposure_us),
                 _NumericTableWidgetItem(_cell_text(row.gain_db), row.gain_db),
                 _NumericTableWidgetItem(_cell_text(row.light_current_ma), row.light_current_ma),

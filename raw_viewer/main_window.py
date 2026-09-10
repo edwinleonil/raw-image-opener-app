@@ -23,6 +23,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .capture_folder import (
+    find_capture_folder_info,
+    format_f_number,
+    format_working_distance,
+)
 from .hdr_tab import HdrBurstTab
 from .ocr_processing import run_ocr
 from .overlap_tab import OverlapTab
@@ -190,6 +195,14 @@ class MainWindow(QMainWindow):
         self.sidecar_label.setWordWrap(True)
         self.sidecar_label.setStyleSheet("color: #666666;")
         metadata_form.addRow(self.sidecar_label)
+
+        # Working distance and aperture come from the capture folder's name
+        # (wd600f4_Capture_...), not from the sidecar - see capture_folder.py.
+        self.working_distance_label = QLabel("—")
+        metadata_form.addRow("Working distance", self.working_distance_label)
+
+        self.aperture_label = QLabel("—")
+        metadata_form.addRow("Aperture", self.aperture_label)
 
         self.exposure_value_label = QLabel("—")
         metadata_form.addRow("exposure_us", self.exposure_value_label)
@@ -578,7 +591,7 @@ class MainWindow(QMainWindow):
         self._last_rendered_path = path
 
         sidecar = load_sidecar_metadata(path)
-        self._update_metadata_panel(sidecar)
+        self._update_metadata_panel(path, sidecar)
         if sidecar is None:
             self._current_image8 = None
             message = f"{path.name}: no matching {path.with_suffix('.json').name} sidecar found"
@@ -624,7 +637,16 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"{self.index + 1} / {len(self.files)} — {path.name}")
         self._update_nav_state()
 
-    def _update_metadata_panel(self, sidecar: dict | None) -> None:
+    def _update_metadata_panel(self, path: Path, sidecar: dict | None) -> None:
+        # Set before the no-sidecar return below: the folder name still says
+        # how the shot was set up even when its sidecar is missing or broken.
+        info = find_capture_folder_info(path)
+        self.working_distance_label.setText(format_working_distance(info))
+        self.aperture_label.setText(format_f_number(info))
+        tooltip = f"From folder {info.folder_name}" if info else ""
+        self.working_distance_label.setToolTip(tooltip)
+        self.aperture_label.setToolTip(tooltip)
+
         if sidecar is None:
             self.sidecar_label.setText("")
             for label in (
