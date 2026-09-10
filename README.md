@@ -4,6 +4,13 @@ A small desktop viewer for headerless `.raw` sensor dumps (e.g. from a
 machine-vision camera). Pick a folder, and step through the images with
 Next / Previous (or the arrow keys).
 
+In the Viewer tab you can paste a full path instead of browsing. A path to
+a `.raw` file loads that file's **whole folder** and jumps to that image, so
+Next / Previous still walks its siblings; a path to a folder loads it from
+the first image. The box then tracks whatever is on screen, so you can copy
+the current image's path straight back out. Paths pasted with surrounding
+quotes (Explorer's "Copy as path") work as-is.
+
 These `.raw` files have no header, so each one needs a matching
 `<name>.json` sidecar next to it describing its width, height, pixel
 format, and Bayer pattern — files without one can't be opened. The

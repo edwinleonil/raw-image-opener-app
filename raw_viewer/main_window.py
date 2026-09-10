@@ -108,7 +108,7 @@ class MainWindow(QMainWindow):
 
         left = QVBoxLayout()
         self.image_label = ZoomableImageView()
-        self.image_label.clear_image("Open a folder to begin")
+        self.image_label.clear_image("Open a folder, or paste an image path, to begin")
         self.image_label.zoom_changed.connect(self._on_zoom_changed)
         self.image_label.measurement_added.connect(self._on_measurement_added)
         self.image_label.measurements_cleared.connect(self._on_measurements_cleared)
@@ -179,7 +179,14 @@ class MainWindow(QMainWindow):
 
         file_path_row = QHBoxLayout()
         self.file_path_edit = QLineEdit()
-        self.file_path_edit.setPlaceholderText("Or enter a path to a single image file…")
+        self.file_path_edit.setPlaceholderText(
+            "Paste a path to a .raw image or a folder, then Enter"
+        )
+        self.file_path_edit.setToolTip(
+            "A .raw image loads its whole folder and jumps to that image; a "
+            "folder loads from its first image. The box then tracks the image "
+            "on screen."
+        )
         self.file_path_edit.returnPressed.connect(self._load_typed_file_path)
         file_path_row.addWidget(self.file_path_edit, stretch=1)
 
@@ -355,8 +362,24 @@ class MainWindow(QMainWindow):
         )
 
     def _connect_shortcuts(self) -> None:
-        QShortcut(QKeySequence(Qt.Key_Right), self, activated=self.show_next)
-        QShortcut(QKeySequence(Qt.Key_Left), self, activated=self.show_previous)
+        QShortcut(QKeySequence(Qt.Key_Right), self, activated=self._on_next_shortcut)
+        QShortcut(QKeySequence(Qt.Key_Left), self, activated=self._on_previous_shortcut)
+
+    # A plain single-key shortcut outranks the focused widget, so the path
+    # box never sees its own arrow keys. Hand them back while it has focus -
+    # otherwise pressing Left to inspect a pasted path would step back an
+    # image and overwrite the text under the cursor.
+    def _on_next_shortcut(self) -> None:
+        if self.file_path_edit.hasFocus():
+            self.file_path_edit.cursorForward(False, 1)
+            return
+        self.show_next()
+
+    def _on_previous_shortcut(self) -> None:
+        if self.file_path_edit.hasFocus():
+            self.file_path_edit.cursorBackward(False, 1)
+            return
+        self.show_previous()
 
     # ---------- settings persistence ----------
     def _load_settings(self) -> None:
@@ -402,8 +425,11 @@ class MainWindow(QMainWindow):
             self._set_folder(Path(folder))
 
     def _browse_for_file(self) -> None:
+        # Start where the user already is, so Browse... is a sibling picker
+        # rather than a trip back to the home directory.
+        start_dir = str(self.folder) if self.folder else ""
         file, _ = QFileDialog.getOpenFileName(
-            self, "Select image file", "", "Raw images (*.raw);;All files (*)"
+            self, "Select image file", start_dir, "Raw images (*.raw);;All files (*)"
         )
         if file:
             self.file_path_edit.setText(file)
@@ -415,24 +441,55 @@ class MainWindow(QMainWindow):
             self._load_file_path(Path(text))
 
     def _load_file_path(self, path: Path) -> None:
-        path = Path(str(path).strip('"')).expanduser()
+        # A single image is loaded as its whole folder, so Next/Previous
+        # still walks the other captures next to it. A folder path behaves
+        # the same as Open Folder... on it.
+        path = Path(str(path).strip().strip('"')).expanduser()
+        if path.is_dir():
+            self._set_folder(path)
+            return
         if not path.is_file():
             self.error_label.setText(f"File not found: {path}")
             return
-        self.files = [path]
-        self.index = 0
-        self.folder_label.setText(f"File: {path.name}")
-        self.folder_label.setToolTip(str(path))
-        self._save_settings()
-        self._render_current()
+        if path.suffix.lower() not in RAW_EXTENSIONS:
+            expected = ", ".join(sorted(RAW_EXTENSIONS))
+            self.error_label.setText(
+                f"Not an image this viewer opens (expected {expected}): {path.name}"
+            )
+            return
+        self._set_folder(path.parent, select=path)
+        # Set after the render, which clears error_label on success. Only
+        # reachable if the file went away between is_file() and iterdir().
+        if self.index < 0 or self.files[self.index] != path:
+            self.error_label.setText(
+                f"{path.name} is no longer in {path.parent} — showing that folder instead"
+            )
 
-    def _set_folder(self, folder: Path) -> None:
+    def _set_folder(self, folder: Path, select: Path | None = None) -> None:
+        """Load every .raw image in `folder`, starting at `select` if given.
+
+        `select` is how a pasted single-file path gets the whole folder
+        behind Next/Previous while still opening the image that was asked
+        for. Matched with `==`, which on Windows ignores case and separator
+        style, so a pasted `top_1.raw` finds the on-disk `Top_1.raw`. An
+        unmatched `select` falls back to the first image - the caller
+        reports that, after the render, because `_render_current` clears
+        `error_label` on success.
+        """
         files = sorted(
             p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in RAW_EXTENSIONS
         )
         self.folder = folder
         self.files = files
-        self.index = 0 if files else -1
+        if not files:
+            self.index = -1
+        elif select is None:
+            self.index = 0
+        else:
+            try:
+                self.index = files.index(select)
+            except ValueError:
+                self.index = 0
         self.folder_label.setText(f"Folder: {folder.name}")
         self.folder_label.setToolTip(str(folder))
         self.overlap_tab.set_available_files(files)
@@ -441,6 +498,9 @@ class MainWindow(QMainWindow):
             self._current_image8 = None
             self._last_rendered_path = None
             self._on_ocr_clear_clicked()
+            # Nothing is on screen, so the box must not keep pointing at an
+            # image from the folder that was open before.
+            self.file_path_edit.clear()
             self.image_label.clear_image(f"No .raw files found in:\n{folder}")
             self.status_label.setText("No .raw files found")
             self._update_nav_state()
@@ -587,6 +647,12 @@ class MainWindow(QMainWindow):
         if self.index < 0 or self.index >= len(self.files):
             return
         path = self.files[self.index]
+        # The box tracks the image on screen so its path can be copied back
+        # out. setText emits neither returnPressed nor textEdited, so this
+        # cannot re-enter _load_typed_file_path. Set before the failure
+        # returns below: a file that won't decode is exactly the one whose
+        # path you want to go and look at.
+        self.file_path_edit.setText(str(path))
         is_new_image = path != self._last_rendered_path
         self._last_rendered_path = path
 
