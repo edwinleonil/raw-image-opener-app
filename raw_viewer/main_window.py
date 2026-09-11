@@ -35,6 +35,7 @@ from .trials_tab import TrialsTab
 from .raw_loader import (
     RawFormatError,
     adjust_brightness_contrast,
+    denoise_image,
     load_sidecar_metadata,
     process_raw_file,
     rotate_image,
@@ -254,6 +255,17 @@ class MainWindow(QMainWindow):
         contrast_row.addWidget(self.contrast_value_label)
         adjustments_form.addRow("Contrast", contrast_row)
 
+        self.denoise_slider = QSlider(Qt.Horizontal)
+        self.denoise_slider.setRange(0, 100)
+        self.denoise_slider.setValue(0)
+        self.denoise_value_label = QLabel("0")
+        self.denoise_value_label.setFixedWidth(40)
+        self.denoise_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        denoise_row = QHBoxLayout()
+        denoise_row.addWidget(self.denoise_slider)
+        denoise_row.addWidget(self.denoise_value_label)
+        adjustments_form.addRow("Denoise", denoise_row)
+
         self.sharpness_slider = QSlider(Qt.Horizontal)
         self.sharpness_slider.setRange(0, 100)
         self.sharpness_slider.setValue(0)
@@ -270,6 +282,9 @@ class MainWindow(QMainWindow):
         )
         self.contrast_slider.valueChanged.connect(
             lambda v: self.contrast_value_label.setText(f"{v + 100}%")
+        )
+        self.denoise_slider.valueChanged.connect(
+            lambda v: self.denoise_value_label.setText(str(v))
         )
         self.sharpness_slider.valueChanged.connect(
             lambda v: self.sharpness_value_label.setText(str(v))
@@ -350,6 +365,7 @@ class MainWindow(QMainWindow):
             self.rotation_combo.currentIndexChanged,
             self.brightness_slider.valueChanged,
             self.contrast_slider.valueChanged,
+            self.denoise_slider.valueChanged,
             self.sharpness_slider.valueChanged,
         ):
             signal.connect(self._on_format_changed)
@@ -387,6 +403,7 @@ class MainWindow(QMainWindow):
         self.rotation_combo.setCurrentIndex(int(s.value("rotation_index", 0)))
         self.brightness_slider.setValue(int(s.value("brightness", 0)))
         self.contrast_slider.setValue(int(s.value("contrast", 0)))
+        self.denoise_slider.setValue(int(s.value("denoise", 0)))
         self.sharpness_slider.setValue(int(s.value("sharpness", 0)))
         last_folder = s.value("last_folder", "")
         if last_folder and Path(last_folder).is_dir():
@@ -401,6 +418,7 @@ class MainWindow(QMainWindow):
         s.setValue("rotation_index", self.rotation_combo.currentIndex())
         s.setValue("brightness", self.brightness_slider.value())
         s.setValue("contrast", self.contrast_slider.value())
+        s.setValue("denoise", self.denoise_slider.value())
         s.setValue("sharpness", self.sharpness_slider.value())
         if self.folder:
             s.setValue("last_folder", str(self.folder))
@@ -535,7 +553,12 @@ class MainWindow(QMainWindow):
         self.zoom_label.setText(f"{percent}%")
 
     def _on_reset_adjustments(self) -> None:
-        for slider in (self.brightness_slider, self.contrast_slider, self.sharpness_slider):
+        for slider in (
+            self.brightness_slider,
+            self.contrast_slider,
+            self.denoise_slider,
+            self.sharpness_slider,
+        ):
             slider.setValue(0)
 
     def _on_measure_mode_toggled(self, enabled: bool) -> None:
@@ -633,10 +656,11 @@ class MainWindow(QMainWindow):
         self.measurements_list.clear()
         self._measurement_count = 0
 
-    def _current_adjustments(self) -> tuple[int, int, int]:
+    def _current_adjustments(self) -> tuple[int, int, int, int]:
         return (
             self.brightness_slider.value(),
             self.contrast_slider.value(),
+            self.denoise_slider.value(),
             self.sharpness_slider.value(),
         )
 
@@ -687,9 +711,11 @@ class MainWindow(QMainWindow):
 
         self.error_label.setText("")
 
-        brightness, contrast, sharpness = self._current_adjustments()
+        brightness, contrast, denoise, sharpness = self._current_adjustments()
         if brightness or contrast:
             image8 = adjust_brightness_contrast(image8, brightness, contrast)
+        if denoise:
+            image8 = denoise_image(image8, denoise)
         if sharpness:
             image8 = sharpen_image(image8, sharpness)
 

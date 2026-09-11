@@ -178,6 +178,27 @@ def adjust_brightness_contrast(image: np.ndarray, brightness: int, contrast: int
     return cv2.convertScaleAbs(image, alpha=alpha, beta=float(brightness))
 
 
+def denoise_image(image: np.ndarray, amount: int) -> np.ndarray:
+    """Apply Non-Local Means denoising to an 8-bit image.
+
+    amount: 0..100 (0 = no-op). Maps to filter strength h/hColor = amount * 0.3
+    (0..30), OpenCV's typical useful range for fastNlMeansDenoising*.
+    """
+    if amount <= 0:
+        return image
+    import cv2
+
+    strength = amount * 0.3
+    if image.ndim == 3:
+        return cv2.fastNlMeansDenoisingColored(
+            image, None, h=strength, hColor=strength,
+            templateWindowSize=7, searchWindowSize=15,
+        )
+    return cv2.fastNlMeansDenoising(
+        image, None, h=strength, templateWindowSize=7, searchWindowSize=15,
+    )
+
+
 def sharpen_image(image: np.ndarray, amount: int) -> np.ndarray:
     """Apply unsharp-mask sharpening to an 8-bit image.
 
